@@ -1,0 +1,5 @@
+build
+.vscode
+TRACE_DATA
+logs/
+*/*_profile
