@@ -1,0 +1,3 @@
+[submodule "third_party/otf2xx"]
+	path = third_party/otf2xx
+	url = git@github.com:tud-zih-energy/otf2xx.git
