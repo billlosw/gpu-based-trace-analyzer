@@ -3,3 +3,4 @@ build
 TRACE_DATA
 logs/
 */*_profile
+helper.sh
