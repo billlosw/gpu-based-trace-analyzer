@@ -13,6 +13,7 @@
 #include <string>
 
 #include <cuda_runtime.h>
+#include <mpi.h>
 
 static void printGpuInfo() {
   int device;
@@ -59,37 +60,61 @@ static void printResult(const char *name, const AnalysisResult &r) {
 }
 
 int main(int argc, char **argv) {
+  MPI_Init(&argc, &argv);
+
+  int mpi_rank = 0, mpi_size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+
   if (argc < 2) {
-    std::cerr << "Usage: " << argv[0] << " <path/to/traces.otf2>" << std::endl;
+    if (mpi_rank == 0)
+      std::cerr << "Usage: " << argv[0] << " <path/to/traces.otf2>" << std::endl;
+    MPI_Finalize();
     return 1;
   }
 
   std::string trace_path = argv[1];
 
-  printGpuInfo();
-  std::cout << std::endl;
-  std::cout << "Trace file: " << trace_path << std::endl;
-  std::cout << std::endl;
+  if (mpi_rank == 0) {
+    printGpuInfo();
+    std::cout << std::endl;
+    std::cout << "Trace file: " << trace_path << std::endl;
+    if (mpi_size > 1)
+      std::cout << "MPI ranks for reading: " << mpi_size << std::endl;
+    std::cout << std::endl;
+  }
 
   auto t_total_start = std::chrono::high_resolution_clock::now();
 
-  // Step 1: Read OTF2 trace into SoA (single-pass)
-  std::cout << "=== Step 1: Reading OTF2 trace ===" << std::endl;
+  // Step 1: Read OTF2 trace into SoA (MPI-parallel)
+  if (mpi_rank == 0)
+    std::cout << "=== Step 1: Reading OTF2 trace ===" << std::endl;
+
   auto t1 = std::chrono::high_resolution_clock::now();
   ReaderOutput reader_output = readOTF2Trace(trace_path);
   auto t2 = std::chrono::high_resolution_clock::now();
   double read_ms =
       std::chrono::duration<double, std::milli>(t2 - t1).count();
-  std::cout << "[Timer] OTF2 read: " << read_ms << " ms" << std::endl;
-  std::cout << "Events: " << reader_output.data.count << std::endl;
-  std::cout << "Data size: "
-            << reader_output.data.sizeInBytes() / (1024.0 * 1024.0) << " MB"
-            << std::endl;
-  std::cout << std::endl;
+
+  if (mpi_rank == 0) {
+    std::cout << "[Timer] OTF2 read: " << read_ms << " ms" << std::endl;
+    std::cout << "Events: " << reader_output.data.count << std::endl;
+    std::cout << "Data size: "
+              << reader_output.data.sizeInBytes() / (1024.0 * 1024.0) << " MB"
+              << std::endl;
+    std::cout << std::endl;
+  }
+
+  // Only rank 0 has the full data — other ranks can finalize
+  if (mpi_rank != 0) {
+    MPI_Finalize();
+    return 0;
+  }
 
   if (reader_output.data.count == 0) {
     std::cerr << "[ERROR] No events read from trace. Check trace file path."
               << std::endl;
+    MPI_Finalize();
     return 1;
   }
 
@@ -182,5 +207,6 @@ int main(int argc, char **argv) {
   std::cout << "Statistics (CPU):     " << stats_ms << " ms" << std::endl;
   std::cout << "Total:                " << total_ms << " ms" << std::endl;
 
+  MPI_Finalize();
   return 0;
 }

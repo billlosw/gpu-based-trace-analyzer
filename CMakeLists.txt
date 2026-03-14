@@ -11,8 +11,11 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 
-# MPI (needed by OTF2/otf2xx at link time)
+# MPI (needed by OTF2/otf2xx at link time, and for parallel reading)
 find_package(MPI REQUIRED)
+
+# Enable otf2xx MPI support for parallel trace reading
+set(OTF2XX_WITH_MPI ON CACHE BOOL "Enable MPI support in otf2xx" FORCE)
 
 # otf2xx (uses its own FindOTF2.cmake to locate OTF2 via otf2-config)
 add_subdirectory(third_party/otf2xx)
@@ -28,6 +31,7 @@ add_library(gpu_analyzer_lib STATIC
 target_include_directories(gpu_analyzer_lib PUBLIC include/)
 target_link_libraries(gpu_analyzer_lib PUBLIC
     otf2xx::otf2xx
+    MPI::MPI_CXX
 )
 set_target_properties(gpu_analyzer_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
