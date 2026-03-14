@@ -148,6 +148,35 @@ struct CollectiveGroupCSR {
   ~CollectiveGroupCSR() { deallocate(); }
   CollectiveGroupCSR(const CollectiveGroupCSR &) = delete;
   CollectiveGroupCSR &operator=(const CollectiveGroupCSR &) = delete;
+  CollectiveGroupCSR(CollectiveGroupCSR &&o) noexcept
+      : num_groups(o.num_groups), offsets(o.offsets), members(o.members),
+        group_types(o.group_types), group_roots(o.group_roots),
+        total_members(o.total_members) {
+    o.offsets = nullptr;
+    o.members = nullptr;
+    o.group_types = nullptr;
+    o.group_roots = nullptr;
+    o.num_groups = 0;
+    o.total_members = 0;
+  }
+  CollectiveGroupCSR &operator=(CollectiveGroupCSR &&o) noexcept {
+    if (this != &o) {
+      deallocate();
+      num_groups = o.num_groups;
+      offsets = o.offsets;
+      members = o.members;
+      group_types = o.group_types;
+      group_roots = o.group_roots;
+      total_members = o.total_members;
+      o.offsets = nullptr;
+      o.members = nullptr;
+      o.group_types = nullptr;
+      o.group_roots = nullptr;
+      o.num_groups = 0;
+      o.total_members = 0;
+    }
+    return *this;
+  }
 
   void deallocate() {
     free(offsets);

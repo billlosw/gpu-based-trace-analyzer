@@ -5,7 +5,6 @@
 #include <tuple>
 #include <vector>
 
-#include <mpi.h>
 #include <otf2xx/otf2.hpp>
 
 // Internal callback class for otf2xx reader
@@ -264,19 +263,12 @@ private:
 ReaderOutput readOTF2Trace(const std::string &trace_path) {
   ReaderOutput output;
 
-  // Initialize MPI if not already initialized (for otf2xx)
-  int mpi_initialized = 0;
-  MPI_Initialized(&mpi_initialized);
-  if (!mpi_initialized) {
-    MPI_Init(nullptr, nullptr);
-  }
-
   auto t_start = std::chrono::high_resolution_clock::now();
 
   // Pass 1: Count events
   size_t total_events = 0;
   {
-    otf2::reader::reader rdr(trace_path, MPI_COMM_SELF);
+    otf2::reader::reader rdr(trace_path);
     SoAReaderCallback cb(rdr, /*counting_pass=*/true);
     rdr.set_callback(cb);
     rdr.read_definitions();
@@ -290,7 +282,7 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
   // Pass 2: Read events into SoA
   output.data.allocate(total_events);
   {
-    otf2::reader::reader rdr(trace_path, MPI_COMM_SELF);
+    otf2::reader::reader rdr(trace_path);
     SoAReaderCallback cb(rdr, /*counting_pass=*/false);
     cb.setDataTarget(&output.data, &output.comm_sets);
     rdr.set_callback(cb);

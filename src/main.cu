@@ -13,7 +13,6 @@
 #include <string>
 
 #include <cuda_runtime.h>
-#include <mpi.h>
 
 static void printGpuInfo() {
   int device;
@@ -60,12 +59,8 @@ static void printResult(const char *name, const AnalysisResult &r) {
 }
 
 int main(int argc, char **argv) {
-  // Initialize MPI (required by otf2xx)
-  MPI_Init(&argc, &argv);
-
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0] << " <path/to/traces.otf2>" << std::endl;
-    MPI_Finalize();
     return 1;
   }
 
@@ -178,6 +173,5 @@ int main(int argc, char **argv) {
   std::cout << "Statistics (CPU):     " << stats_ms << " ms" << std::endl;
   std::cout << "Total:                " << total_ms << " ms" << std::endl;
 
-  MPI_Finalize();
   return 0;
 }

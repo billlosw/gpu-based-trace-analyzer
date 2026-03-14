@@ -11,14 +11,7 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 
-# Find OTF2 via pkg-config (installed via spack)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(OTF2 REQUIRED IMPORTED_TARGET otf2)
-
-# Find MPI (needed for otf2xx reader)
-find_package(MPI REQUIRED)
-
-# otf2xx header-only library
+# otf2xx (uses its own FindOTF2.cmake to locate OTF2 via otf2-config)
 add_subdirectory(third_party/otf2xx)
 
 # Main library
@@ -32,10 +25,7 @@ add_library(gpu_analyzer_lib STATIC
 target_include_directories(gpu_analyzer_lib PUBLIC include/)
 target_link_libraries(gpu_analyzer_lib PUBLIC
     otf2xx::otf2xx
-    PkgConfig::OTF2
-    MPI::MPI_CXX
 )
-target_compile_definitions(gpu_analyzer_lib PUBLIC OTF2XX_WITH_MPI)
 set_target_properties(gpu_analyzer_lib PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON
