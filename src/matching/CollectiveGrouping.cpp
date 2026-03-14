@@ -2,14 +2,16 @@
 
 #include <algorithm>
 #include <iostream>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
 // Build collective groups from SoA data on the CPU.
-// Follows TileTrace's InteractionPattern logic for collective matching:
-// - Root events create groups and collect members from their comm_set
-// - Non-root events attach to an existing root group
-// - Events are grouped by (type, root) in temporal order
+// Strategy: process collective events in timestamp order. For each event,
+// look for an open (incomplete) group with the same type and comm_set that
+// still needs this process's contribution. If found, add to it. Otherwise,
+// create a new group.
 void buildCollectiveGroups(const TraceDataSoA &data,
                            const std::vector<std::vector<uint64_t>> &comm_sets,
                            CollectiveGroupCSR &out_csr) {
@@ -19,145 +21,134 @@ void buildCollectiveGroups(const TraceDataSoA &data,
   if (n == 0)
     return;
 
-  // Collect indices of collective events
+  // Collect indices of collective events and build soa_idx -> comm_set_idx map
   std::vector<size_t> coll_indices;
-  for (size_t i = 0; i < n; i++) {
-    event_t ev = data.events[i];
-    if (ev >= TT_MPI_Bcast && ev <= TT_MPI_AlltoAll)
-      coll_indices.push_back(i);
+  std::unordered_map<size_t, size_t> soa_to_commset;
+  {
+    size_t cs_idx = 0;
+    for (size_t i = 0; i < n; i++) {
+      event_t ev = data.events[i];
+      if (ev >= TT_MPI_Bcast && ev <= TT_MPI_AlltoAll) {
+        coll_indices.push_back(i);
+        if (cs_idx < comm_sets.size()) {
+          soa_to_commset[i] = cs_idx;
+          cs_idx++;
+        }
+      }
+    }
   }
 
   if (coll_indices.empty())
     return;
 
-  // Sort collective indices by timestamp (should already be sorted from OTF2)
+  // Sort by timestamp
   std::sort(coll_indices.begin(), coll_indices.end(),
             [&](size_t a, size_t b) {
               return data.timestamps[a] < data.timestamps[b];
             });
 
-  // Map from event SoA index to its comm_set index in the comm_sets vector
-  // comm_sets is built by the reader and corresponds to collective events in order
-  std::unordered_map<size_t, size_t> soa_to_commset;
-  {
-    size_t cs_idx = 0;
-    for (size_t i = 0; i < n && cs_idx < comm_sets.size(); i++) {
-      event_t ev = data.events[i];
-      if (ev >= TT_MPI_Bcast && ev <= TT_MPI_AlltoAll) {
-        soa_to_commset[i] = cs_idx;
-        cs_idx++;
-      }
-    }
-  }
+  // Represent a comm_set as a sorted vector for use as a map key
+  auto normalizeCommSet = [](const std::vector<uint64_t> &cs) -> std::vector<uint64_t> {
+    std::vector<uint64_t> sorted_cs(cs);
+    std::sort(sorted_cs.begin(), sorted_cs.end());
+    return sorted_cs;
+  };
 
-  // Group tracking: each group has a root event index and member event indices.
+  // Group tracking
   struct PendingGroup {
-    size_t root_event_idx;
-    std::vector<size_t> member_indices;
+    event_t type;
+    id_t root;
+    std::vector<uint64_t> comm_set_key; // sorted comm_set for identification
+    std::set<id_t> needed_pids;         // PIDs still expected
+    std::vector<size_t> member_indices;  // SoA event indices
     size_t expected_size;
-    bool complete;
   };
 
-  // Key: (type_offset * 1000000 + root)
-  // We use type_offset = event_type - TT_MPI_Bcast (same as TileTrace)
-  auto makeGroupKey = [](event_t ev, id_t root) -> uint64_t {
-    return (uint64_t)(ev - TT_MPI_Bcast) * 1000000ULL + root;
-  };
-
-  std::unordered_map<uint64_t, std::vector<PendingGroup>> pending;
+  // Key: event_type -> list of pending groups
+  std::unordered_map<int, std::vector<PendingGroup>> pending_by_type;
   std::vector<PendingGroup> completed_groups;
 
-  for (size_t ci_idx = 0; ci_idx < coll_indices.size(); ci_idx++) {
-    size_t ev_idx = coll_indices[ci_idx];
+  for (size_t ci = 0; ci < coll_indices.size(); ci++) {
+    size_t ev_idx = coll_indices[ci];
     event_t etype = data.events[ev_idx];
     id_t pid = data.pids[ev_idx];
     id_t root = data.roots[ev_idx];
 
-    uint64_t gkey = makeGroupKey(etype, root);
-
+    // Get comm_set for this event
+    std::vector<uint64_t> cs_key;
     size_t expected = 0;
     auto cs_it = soa_to_commset.find(ev_idx);
     if (cs_it != soa_to_commset.end() && cs_it->second < comm_sets.size()) {
-      expected = comm_sets[cs_it->second].size();
+      cs_key = normalizeCommSet(comm_sets[cs_it->second]);
+      expected = cs_key.size();
     }
 
-    if (pid == root) {
-      // Root event: create new group
-      PendingGroup pg;
-      pg.root_event_idx = ev_idx;
-      pg.member_indices.push_back(ev_idx);
-      pg.expected_size = expected > 0 ? expected : 1;
-      pg.complete = false;
+    if (cs_key.empty() || expected == 0)
+      continue;
 
-      // Check if any pending non-root events match
-      if (pending.count(gkey)) {
-        auto &plist = pending[gkey];
-        // Try to match pending members
-        auto it = plist.begin();
-        while (it != plist.end() &&
-               pg.member_indices.size() < pg.expected_size) {
-          if (it->root_event_idx == SIZE_MAX) {
-            // This is a pending non-root event
-            for (auto midx : it->member_indices) {
-              pg.member_indices.push_back(midx);
-            }
-            it = plist.erase(it);
-          } else {
-            ++it;
-          }
-        }
-      }
+    int type_key = (int)etype;
+    bool matched = false;
 
-      if (pg.member_indices.size() >= pg.expected_size) {
-        pg.complete = true;
-        completed_groups.push_back(pg);
-      } else {
-        pending[gkey].push_back(pg);
-      }
-    } else {
-      // Non-root event: try to attach to existing root group
-      bool matched = false;
-
-      if (pending.count(gkey)) {
-        auto &plist = pending[gkey];
-        for (auto &pg : plist) {
-          if (pg.root_event_idx != SIZE_MAX &&
-              pg.member_indices.size() < pg.expected_size) {
-            pg.member_indices.push_back(ev_idx);
-            if (pg.member_indices.size() >= pg.expected_size) {
-              pg.complete = true;
-              completed_groups.push_back(pg);
-            }
-            matched = true;
-            break;
-          }
-        }
-      }
-
-      if (!matched) {
-        // Store as pending non-root member
-        PendingGroup pg;
-        pg.root_event_idx = SIZE_MAX;
-        pg.member_indices.push_back(ev_idx);
-        pg.expected_size = expected > 0 ? expected : 0;
-        pg.complete = false;
-        pending[gkey].push_back(pg);
-      }
-    }
-  }
-
-  // Also include incomplete groups with at least 2 members (partial matches)
-  for (auto &[key, plist] : pending) {
+    // Try to find a pending group of the same type with matching comm_set
+    // that still needs this pid
+    auto &plist = pending_by_type[type_key];
     for (auto &pg : plist) {
-      if (!pg.complete && pg.member_indices.size() >= 2 &&
-          pg.root_event_idx != SIZE_MAX) {
-        completed_groups.push_back(pg);
+      if (pg.comm_set_key == cs_key && pg.needed_pids.count(pid)) {
+        pg.member_indices.push_back(ev_idx);
+        pg.needed_pids.erase(pid);
+
+        if (pg.needed_pids.empty()) {
+          // Group complete
+          completed_groups.push_back(std::move(pg));
+          pg.expected_size = 0; // Mark for removal
+        }
+        matched = true;
+        break;
+      }
+    }
+
+    // Remove completed groups from pending
+    plist.erase(
+        std::remove_if(plist.begin(), plist.end(),
+                        [](const PendingGroup &pg) { return pg.expected_size == 0; }),
+        plist.end());
+
+    if (!matched) {
+      // Create new group
+      PendingGroup pg;
+      pg.type = etype;
+      pg.root = root;
+      pg.comm_set_key = cs_key;
+      pg.expected_size = expected;
+      pg.member_indices.push_back(ev_idx);
+      // Build needed_pids from comm_set, excluding this pid
+      for (auto member_pid : cs_key) {
+        if ((id_t)member_pid != pid) {
+          pg.needed_pids.insert((id_t)member_pid);
+        }
+      }
+      if (pg.needed_pids.empty()) {
+        // Single-member group (shouldn't happen for real collectives)
+        completed_groups.push_back(std::move(pg));
+      } else {
+        plist.push_back(std::move(pg));
       }
     }
   }
 
-  if (completed_groups.empty())
+  // Also include incomplete groups with at least 2 members
+  for (auto &[type_key, plist] : pending_by_type) {
+    for (auto &pg : plist) {
+      if (pg.member_indices.size() >= 2) {
+        completed_groups.push_back(std::move(pg));
+      }
+    }
+  }
+
+  if (completed_groups.empty()) {
+    std::cout << "[CollectiveGrouping] No groups formed" << std::endl;
     return;
+  }
 
   // Build CSR arrays
   size_t num_groups = completed_groups.size();
@@ -175,15 +166,24 @@ void buildCollectiveGroups(const TraceDataSoA &data,
   size_t offset = 0;
   for (size_t g = 0; g < num_groups; g++) {
     out_csr.offsets[g] = (int32_t)offset;
-    out_csr.group_types[g] = data.events[completed_groups[g].member_indices[0]];
-    out_csr.group_roots[g] = data.roots[completed_groups[g].member_indices[0]];
+    out_csr.group_types[g] = completed_groups[g].type;
+    out_csr.group_roots[g] = completed_groups[g].root;
     for (auto midx : completed_groups[g].member_indices) {
       out_csr.members[offset++] = (int32_t)midx;
     }
   }
   out_csr.offsets[num_groups] = (int32_t)offset;
 
+  // Count by type for diagnostics
+  std::unordered_map<int, size_t> type_counts;
+  for (auto &g : completed_groups)
+    type_counts[(int)g.type]++;
+
   std::cout << "[CollectiveGrouping] Built " << num_groups
             << " groups with " << total_members << " total members"
             << std::endl;
+  for (auto &[t, c] : type_counts) {
+    if (t >= 0 && t < NUM_EVENT_T)
+      std::cout << "  " << event_strings[t] << ": " << c << " groups" << std::endl;
+  }
 }

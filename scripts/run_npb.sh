@@ -19,7 +19,8 @@ spack load openmpi
 spack load otf2@3.0.3
 
 # Check for pre-existing trace data
-TRACE_DIR="TRACE_DATA/NPB/scorep_${BENCHMARK}_${NPROCS}_trace"
+# TRACE_DIR="TRACE_DATA/NPB/scorep_${BENCHMARK}_${NPROCS}_trace"
+TRACE_DIR="/home/luosw22/TileTrace/exp/cg_trace"
 OTF2_FILE="${TRACE_DIR}/traces.otf2"
 
 if [ ! -f "${OTF2_FILE}" ]; then

@@ -11,6 +11,9 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 
+# MPI (needed by OTF2/otf2xx at link time)
+find_package(MPI REQUIRED)
+
 # otf2xx (uses its own FindOTF2.cmake to locate OTF2 via otf2-config)
 add_subdirectory(third_party/otf2xx)
 

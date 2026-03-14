@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
 
   auto t_total_start = std::chrono::high_resolution_clock::now();
 
-  // Step 1: Read OTF2 trace into SoA
+  // Step 1: Read OTF2 trace into SoA (single-pass)
   std::cout << "=== Step 1: Reading OTF2 trace ===" << std::endl;
   auto t1 = std::chrono::high_resolution_clock::now();
   ReaderOutput reader_output = readOTF2Trace(trace_path);
@@ -87,23 +87,20 @@ int main(int argc, char **argv) {
             << std::endl;
   std::cout << std::endl;
 
-  // Step 2: P2P Matching on GPU
-  std::cout << "=== Step 2: P2P Matching (GPU) ===" << std::endl;
+  if (reader_output.data.count == 0) {
+    std::cerr << "[ERROR] No events read from trace. Check trace file path."
+              << std::endl;
+    return 1;
+  }
+
+  // Step 2: P2P Matching (CPU, timestamp-sorted)
+  std::cout << "=== Step 2: P2P Matching ===" << std::endl;
   t1 = std::chrono::high_resolution_clock::now();
   runP2PMatching(reader_output.data);
   t2 = std::chrono::high_resolution_clock::now();
   double match_ms =
       std::chrono::duration<double, std::milli>(t2 - t1).count();
   std::cout << "[Timer] P2P matching: " << match_ms << " ms" << std::endl;
-
-  // Count matches
-  size_t match_count = 0;
-  for (size_t i = 0; i < reader_output.data.count; i++) {
-    if (reader_output.data.match_partner[i] >= 0)
-      match_count++;
-  }
-  std::cout << "Matched events: " << match_count << " (pairs: "
-            << match_count / 2 << ")" << std::endl;
   std::cout << std::endl;
 
   // Step 3: Collective Grouping on CPU
@@ -126,6 +123,18 @@ int main(int argc, char **argv) {
   double analysis_ms =
       std::chrono::duration<double, std::milli>(t2 - t1).count();
   std::cout << "[Timer] Analysis kernels: " << analysis_ms << " ms"
+            << std::endl;
+
+  // Print raw counts for diagnostics
+  std::cout << "[Analysis] Raw counts: "
+            << "LS=" << raw.late_sender.size()
+            << " LR=" << raw.late_receiver.size()
+            << " BW=" << raw.barrier_wait.size()
+            << " BC=" << raw.barrier_completion.size()
+            << " ER=" << raw.early_reduce.size()
+            << " LB=" << raw.late_broadcast.size()
+            << " WN=" << raw.wait_nxn.size()
+            << " NC=" << raw.nxn_completion.size()
             << std::endl;
   std::cout << std::endl;
 
@@ -167,7 +176,7 @@ int main(int argc, char **argv) {
   std::cout << "=== Timing Summary ===" << std::endl;
   std::cout << "OTF2 Read:            " << std::fixed << std::setprecision(2)
             << read_ms << " ms" << std::endl;
-  std::cout << "P2P Matching (GPU):   " << match_ms << " ms" << std::endl;
+  std::cout << "P2P Matching:         " << match_ms << " ms" << std::endl;
   std::cout << "Coll. Grouping (CPU): " << group_ms << " ms" << std::endl;
   std::cout << "Analysis (GPU):       " << analysis_ms << " ms" << std::endl;
   std::cout << "Statistics (CPU):     " << stats_ms << " ms" << std::endl;

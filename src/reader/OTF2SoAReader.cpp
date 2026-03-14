@@ -7,126 +7,66 @@
 
 #include <otf2xx/otf2.hpp>
 
-// Internal callback class for otf2xx reader
+// Internal callback class for otf2xx reader — single-pass using vectors
 class SoAReaderCallback : public otf2::reader::callback {
 public:
-  SoAReaderCallback(otf2::reader::reader &rdr, bool counting_pass)
-      : m_rdr(rdr), m_counting(counting_pass) {}
+  SoAReaderCallback(otf2::reader::reader &rdr) : m_rdr(rdr) {}
 
   // --- Definition callbacks ---
   void definition(const otf2::definition::location &loc) override {
-    // Register all locations for reading
     m_rdr.register_location(loc);
   }
 
-  void definitions_done(const otf2::reader::reader &) override {
-    if (!m_counting) {
-      m_nlocs = m_rdr.num_locations();
-    }
-  }
+  void definitions_done(const otf2::reader::reader &) override {}
 
   // --- P2P event callbacks ---
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_send &event) override {
-    if (m_counting) {
-      m_event_count++;
-      return;
-    }
-    size_t i = m_write_pos++;
     id_t pid = loc.ref().get();
     auto ts = extractTimestamp(event.timestamp());
 
-    m_data->events[i] = TT_MPI_Send;
-    m_data->types[i] = ENTER;
-    m_data->timestamps[i] = ts;
-    m_data->end_timestamps[i] = ts;
-    m_data->pids[i] = pid;
-    m_data->tids[i] = 0;
-    m_data->replay_pids[i] = pid;
-    m_data->srcs[i] = pid;
-    m_data->dsts[i] = event.receiver();
-    m_data->tags[i] = event.msg_tag();
-    m_data->roots[i] = 0;
-    m_data->indices[i] = (id_t)i;
+    pushEvent(TT_MPI_Send, ENTER, ts, ts, pid,
+              pid, event.receiver(), event.msg_tag(), 0);
+
+    m_send_count++;
   }
 
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_receive &event) override {
-    if (m_counting) {
-      m_event_count++;
-      return;
-    }
-    size_t i = m_write_pos++;
     id_t pid = loc.ref().get();
     auto ts = extractTimestamp(event.timestamp());
 
-    m_data->events[i] = TT_MPI_Recv;
-    m_data->types[i] = ENTER;
-    m_data->timestamps[i] = ts;
-    m_data->end_timestamps[i] = ts;
-    m_data->pids[i] = pid;
-    m_data->tids[i] = 0;
-    m_data->replay_pids[i] = pid;
-    m_data->srcs[i] = event.sender();
-    m_data->dsts[i] = pid;
-    m_data->tags[i] = event.msg_tag();
-    m_data->roots[i] = 0;
-    m_data->indices[i] = (id_t)i;
+    pushEvent(TT_MPI_Recv, ENTER, ts, ts, pid,
+              event.sender(), pid, event.msg_tag(), 0);
+
+    m_recv_count++;
   }
 
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_isend_request &event) override {
-    if (m_counting) {
-      m_event_count++;
-      return;
-    }
-    size_t i = m_write_pos++;
     id_t pid = loc.ref().get();
     auto ts = extractTimestamp(event.timestamp());
 
-    m_data->events[i] = TT_MPI_Isend;
-    m_data->types[i] = ENTER;
-    m_data->timestamps[i] = ts;
-    m_data->end_timestamps[i] = ts;
-    m_data->pids[i] = pid;
-    m_data->tids[i] = 0;
-    m_data->replay_pids[i] = pid;
-    m_data->srcs[i] = pid;
-    m_data->dsts[i] = event.receiver();
-    m_data->tags[i] = event.msg_tag();
-    m_data->roots[i] = 0;
-    m_data->indices[i] = (id_t)i;
+    pushEvent(TT_MPI_Isend, ENTER, ts, ts, pid,
+              pid, event.receiver(), event.msg_tag(), 0);
+
+    m_send_count++;
   }
 
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_ireceive_complete &event) override {
-    if (m_counting) {
-      m_event_count++;
-      return;
-    }
-    size_t i = m_write_pos++;
     id_t pid = loc.ref().get();
     auto ts = extractTimestamp(event.timestamp());
 
-    m_data->events[i] = TT_MPI_Irecv;
-    m_data->types[i] = ENTER;
-    m_data->timestamps[i] = ts;
-    m_data->end_timestamps[i] = ts;
-    m_data->pids[i] = pid;
-    m_data->tids[i] = 0;
-    m_data->replay_pids[i] = pid;
-    m_data->srcs[i] = event.sender();
-    m_data->dsts[i] = pid;
-    m_data->tags[i] = event.msg_tag();
-    m_data->roots[i] = 0;
-    m_data->indices[i] = (id_t)i;
+    pushEvent(TT_MPI_Irecv, ENTER, ts, ts, pid,
+              event.sender(), pid, event.msg_tag(), 0);
+
+    m_recv_count++;
   }
 
   // --- Collective event callbacks ---
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_collective_begin &event) override {
-    if (m_counting)
-      return; // Don't count begin events separately
     id_t pid = loc.ref().get();
     auto ts = extractTimestamp(event.timestamp());
     m_coll_begin_ts[pid] = ts;
@@ -136,12 +76,6 @@ public:
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_collective_end &event) override {
     id_t pid = loc.ref().get();
-
-    if (m_counting) {
-      // Only count if we can pair with a begin
-      m_event_count++;
-      return;
-    }
 
     if (!m_coll_begin_valid[pid])
       return;
@@ -197,60 +131,94 @@ public:
         root = std::min(root, (uint32_t)id);
     }
 
-    size_t i = m_write_pos++;
-    m_data->events[i] = op_type;
-    m_data->types[i] = ENTER;
-    m_data->timestamps[i] = begin_ts;
-    m_data->end_timestamps[i] = end_ts;
-    m_data->pids[i] = pid;
-    m_data->tids[i] = 0;
-    m_data->replay_pids[i] = pid;
-    m_data->srcs[i] = 0;
-    m_data->dsts[i] = 0;
-    m_data->tags[i] = 0;
-    m_data->roots[i] = root;
-    m_data->indices[i] = (id_t)i;
+    size_t i = m_v_events.size();
+    pushEvent(op_type, ENTER, begin_ts, end_ts, pid,
+              0, 0, 0, root);
 
     // Store comm_set
     std::vector<uint64_t> cs(comm_set.begin(), comm_set.end());
-    m_comm_sets_out->push_back(std::move(cs));
+    m_comm_sets_out.push_back(std::move(cs));
     m_coll_soa_indices.push_back(i);
+
+    m_coll_count++;
   }
 
   void events_done(const otf2::reader::reader &) override {}
 
   // --- Accessors ---
-  size_t getEventCount() const { return m_event_count; }
-  void setDataTarget(TraceDataSoA *data,
-                     std::vector<std::vector<uint64_t>> *comm_sets) {
-    m_data = data;
-    m_comm_sets_out = comm_sets;
-    m_write_pos = 0;
-  }
-  size_t getWritePos() const { return m_write_pos; }
+  size_t getEventCount() const { return m_v_events.size(); }
+  size_t getSendCount() const { return m_send_count; }
+  size_t getRecvCount() const { return m_recv_count; }
+  size_t getCollCount() const { return m_coll_count; }
+
   const std::vector<size_t> &getCollSoAIndices() const {
     return m_coll_soa_indices;
   }
 
+  // Copy vector data into pre-allocated TraceDataSoA
+  void fillSoA(TraceDataSoA &data) const {
+    size_t n = m_v_events.size();
+    data.allocate(n);
+    data.count = n;
+    std::memcpy(data.events, m_v_events.data(), n * sizeof(event_t));
+    std::memcpy(data.types, m_v_types.data(), n * sizeof(event_type_t));
+    std::memcpy(data.timestamps, m_v_timestamps.data(), n * sizeof(timestamp_t));
+    std::memcpy(data.end_timestamps, m_v_end_timestamps.data(), n * sizeof(timestamp_t));
+    std::memcpy(data.pids, m_v_pids.data(), n * sizeof(id_t));
+    std::memcpy(data.srcs, m_v_srcs.data(), n * sizeof(id_t));
+    std::memcpy(data.dsts, m_v_dsts.data(), n * sizeof(id_t));
+    std::memcpy(data.tags, m_v_tags.data(), n * sizeof(id_t));
+    std::memcpy(data.roots, m_v_roots.data(), n * sizeof(id_t));
+    // tids and replay_pids: set to pids
+    std::memcpy(data.replay_pids, m_v_pids.data(), n * sizeof(id_t));
+    std::memset(data.tids, 0, n * sizeof(id_t));
+    // indices: fill with 0..n-1
+    for (size_t i = 0; i < n; i++)
+      data.indices[i] = (id_t)i;
+  }
+
+  std::vector<std::vector<uint64_t>> &getCommSets() { return m_comm_sets_out; }
+
 private:
   otf2::reader::reader &m_rdr;
-  bool m_counting;
 
-  // Counting pass
-  size_t m_event_count = 0;
+  // Dynamic vectors for single-pass reading
+  std::vector<event_t> m_v_events;
+  std::vector<event_type_t> m_v_types;
+  std::vector<timestamp_t> m_v_timestamps;
+  std::vector<timestamp_t> m_v_end_timestamps;
+  std::vector<id_t> m_v_pids;
+  std::vector<id_t> m_v_srcs;
+  std::vector<id_t> m_v_dsts;
+  std::vector<id_t> m_v_tags;
+  std::vector<id_t> m_v_roots;
 
-  // Writing pass
-  TraceDataSoA *m_data = nullptr;
-  std::vector<std::vector<uint64_t>> *m_comm_sets_out = nullptr;
-  size_t m_write_pos = 0;
-  size_t m_nlocs = 0;
+  // Comm sets for collective events
+  std::vector<std::vector<uint64_t>> m_comm_sets_out;
+  std::vector<size_t> m_coll_soa_indices;
 
   // Collective begin/end pairing
   std::unordered_map<id_t, timestamp_t> m_coll_begin_ts;
   std::unordered_map<id_t, bool> m_coll_begin_valid;
 
-  // Tracks which SoA indices are collective events
-  std::vector<size_t> m_coll_soa_indices;
+  // Counts for diagnostics
+  size_t m_send_count = 0;
+  size_t m_recv_count = 0;
+  size_t m_coll_count = 0;
+
+  void pushEvent(event_t ev, event_type_t type, timestamp_t ts,
+                 timestamp_t end_ts, id_t pid, id_t src, id_t dst,
+                 id_t tag, id_t root) {
+    m_v_events.push_back(ev);
+    m_v_types.push_back(type);
+    m_v_timestamps.push_back(ts);
+    m_v_end_timestamps.push_back(end_ts);
+    m_v_pids.push_back(pid);
+    m_v_srcs.push_back(src);
+    m_v_dsts.push_back(dst);
+    m_v_tags.push_back(tag);
+    m_v_roots.push_back(root);
+  }
 
   static timestamp_t
   extractTimestamp(const otf2::chrono::time_point &tp) {
@@ -265,36 +233,32 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
 
   auto t_start = std::chrono::high_resolution_clock::now();
 
-  // Pass 1: Count events
-  size_t total_events = 0;
+  // Single-pass reading using dynamic vectors
   {
     otf2::reader::reader rdr(trace_path);
-    SoAReaderCallback cb(rdr, /*counting_pass=*/true);
+    SoAReaderCallback cb(rdr);
     rdr.set_callback(cb);
     rdr.read_definitions();
     rdr.read_events();
-    total_events = cb.getEventCount();
-  }
 
-  std::cout << "[Reader] Pass 1 done: " << total_events << " events counted"
-            << std::endl;
+    auto t_read = std::chrono::high_resolution_clock::now();
+    double read_ms = std::chrono::duration<double, std::milli>(t_read - t_start).count();
 
-  // Pass 2: Read events into SoA
-  output.data.allocate(total_events);
-  {
-    otf2::reader::reader rdr(trace_path);
-    SoAReaderCallback cb(rdr, /*counting_pass=*/false);
-    cb.setDataTarget(&output.data, &output.comm_sets);
-    rdr.set_callback(cb);
-    rdr.read_definitions();
-    rdr.read_events();
-    output.data.count = cb.getWritePos();
+    size_t total = cb.getEventCount();
+    std::cout << "[Reader] Read " << total << " events in " << read_ms << " ms"
+              << std::endl;
+    std::cout << "[Reader] Breakdown: " << cb.getSendCount() << " sends, "
+              << cb.getRecvCount() << " recvs, "
+              << cb.getCollCount() << " collectives" << std::endl;
+
+    // Copy from vectors to SoA
+    cb.fillSoA(output.data);
+    output.comm_sets = std::move(cb.getCommSets());
   }
 
   auto t_end = std::chrono::high_resolution_clock::now();
-  double read_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-  std::cout << "[Reader] Pass 2 done: " << output.data.count
-            << " events read in " << read_ms << " ms" << std::endl;
+  double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+  std::cout << "[Reader] Total (read + copy): " << total_ms << " ms" << std::endl;
 
   return output;
 }
