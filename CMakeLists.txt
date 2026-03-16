@@ -11,6 +11,21 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 
+# Timestamp mode: SCALASCA (default) uses Enter-region timestamps for
+# Scalasca-compatible results. TILETRACE uses point-event timestamps
+# for TileTrace-compatible results.
+set(TIMESTAMP_MODE "SCALASCA" CACHE STRING "Timestamp semantics: SCALASCA or TILETRACE")
+set_property(CACHE TIMESTAMP_MODE PROPERTY STRINGS SCALASCA TILETRACE)
+if(TIMESTAMP_MODE STREQUAL "TILETRACE")
+  message(STATUS "Timestamp mode: TILETRACE (point-event timestamps)")
+  add_compile_definitions(USE_TILETRACE_TIMESTAMPS)
+elseif(TIMESTAMP_MODE STREQUAL "SCALASCA")
+  message(STATUS "Timestamp mode: SCALASCA (Enter-region timestamps)")
+  add_compile_definitions(USE_SCALASCA_TIMESTAMPS)
+else()
+  message(FATAL_ERROR "TIMESTAMP_MODE must be SCALASCA or TILETRACE, got: ${TIMESTAMP_MODE}")
+endif()
+
 # MPI (needed by OTF2/otf2xx at link time, and for parallel reading)
 find_package(MPI REQUIRED)
 

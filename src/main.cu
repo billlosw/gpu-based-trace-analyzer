@@ -79,6 +79,11 @@ int main(int argc, char **argv) {
     printGpuInfo();
     std::cout << std::endl;
     std::cout << "Trace file: " << trace_path << std::endl;
+#ifdef USE_SCALASCA_TIMESTAMPS
+    std::cout << "Timestamp mode: SCALASCA (Enter-region timestamps)" << std::endl;
+#else
+    std::cout << "Timestamp mode: TILETRACE (point-event timestamps)" << std::endl;
+#endif
     if (mpi_size > 1)
       std::cout << "MPI ranks for reading: " << mpi_size << std::endl;
     std::cout << std::endl;
