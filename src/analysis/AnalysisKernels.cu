@@ -11,6 +11,7 @@
 __global__ void
 kernelLateSenderReceiver(const event_t *__restrict__ events,
                          const timestamp_t *__restrict__ timestamps,
+                         const timestamp_t *__restrict__ end_timestamps,
                          const int32_t *__restrict__ match_partner, size_t n,
                          double *__restrict__ late_sender_out,
                          unsigned int *__restrict__ late_sender_cnt,
@@ -26,17 +27,19 @@ kernelLateSenderReceiver(const event_t *__restrict__ events,
       continue;
 
     int32_t send_idx = match_partner[i];
-    timestamp_t recv_ts = timestamps[i];
-    timestamp_t send_ts = timestamps[send_idx];
+    // recv_enter: Enter(MPI_Recv) or Enter(MPI_Wait) for non-blocking
+    // send_enter: point event timestamp ≈ Enter(MPI_Send/MPI_Isend)
+    timestamp_t recv_enter = timestamps[i];
+    timestamp_t send_enter = timestamps[send_idx];
 
-    if (send_ts > recv_ts) {
-      // Late sender: sender arrived after receiver
+    if (send_enter > recv_enter) {
+      // Late sender: sender arrived after receiver started waiting.
       unsigned int pos = atomicAdd(late_sender_cnt, 1u);
-      late_sender_out[pos] = (double)(send_ts - recv_ts);
-    } else if (recv_ts > send_ts) {
-      // Late receiver: receiver arrived after sender
+      late_sender_out[pos] = (double)(send_enter - recv_enter);
+    } else if (recv_enter > send_enter) {
+      // Late receiver: receiver arrived after sender.
       unsigned int pos = atomicAdd(late_receiver_cnt, 1u);
-      late_receiver_out[pos] = (double)(recv_ts - send_ts);
+      late_receiver_out[pos] = (double)(recv_enter - send_enter);
     }
   }
 }
@@ -266,6 +269,15 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   if (n == 0)
     return output;
 
+  // ---- CUDA event timing ----
+  cudaEvent_t ev_start, ev_h2d_done, ev_p2p_done, ev_coll_done;
+  CUDA_CHECK(cudaEventCreate(&ev_start));
+  CUDA_CHECK(cudaEventCreate(&ev_h2d_done));
+  CUDA_CHECK(cudaEventCreate(&ev_p2p_done));
+  CUDA_CHECK(cudaEventCreate(&ev_coll_done));
+
+  CUDA_CHECK(cudaEventRecord(ev_start));
+
   // ---- Allocate device arrays for trace data ----
   event_t *d_events;
   timestamp_t *d_timestamps, *d_end_timestamps;
@@ -292,6 +304,8 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   CUDA_CHECK(cudaMemcpy(d_roots, data.roots, n * sizeof(id_t),
                          cudaMemcpyHostToDevice));
 
+  CUDA_CHECK(cudaEventRecord(ev_h2d_done));
+
   // ---- Allocate output arrays on device ----
   // Max possible output size = n (every event produces a result)
   double *d_ls_out, *d_lr_out;
@@ -307,8 +321,9 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   int blockSize = 256;
   int gridSize = (int)std::min((n + 255) / 256, (size_t)1024);
   kernelLateSenderReceiver<<<gridSize, blockSize>>>(
-      d_events, d_timestamps, d_match, n, d_ls_out, d_ls_cnt, d_lr_out,
+      d_events, d_timestamps, d_end_timestamps, d_match, n, d_ls_out, d_ls_cnt, d_lr_out,
       d_lr_cnt);
+  CUDA_CHECK(cudaEventRecord(ev_p2p_done));
   CUDA_CHECK(cudaDeviceSynchronize());
 
   // Read back P2P results
@@ -416,6 +431,7 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
         d_group_types, csr.num_groups, d_wn_out, d_wn_cnt, d_nc_out,
         d_nc_cnt);
 
+    CUDA_CHECK(cudaEventRecord(ev_coll_done));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Read back collective results
@@ -476,6 +492,19 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   CUDA_CHECK(cudaFree(d_match));
   CUDA_CHECK(cudaFree(d_pids));
   CUDA_CHECK(cudaFree(d_roots));
+
+  // ---- Compute sub-phase timings ----
+  CUDA_CHECK(cudaEventSynchronize(ev_p2p_done));
+  CUDA_CHECK(cudaEventElapsedTime(&output.h2d_ms, ev_start, ev_h2d_done));
+  CUDA_CHECK(cudaEventElapsedTime(&output.p2p_kernel_ms, ev_h2d_done, ev_p2p_done));
+  if (csr.num_groups > 0) {
+    CUDA_CHECK(cudaEventElapsedTime(&output.coll_kernel_ms, ev_p2p_done, ev_coll_done));
+  }
+
+  CUDA_CHECK(cudaEventDestroy(ev_start));
+  CUDA_CHECK(cudaEventDestroy(ev_h2d_done));
+  CUDA_CHECK(cudaEventDestroy(ev_p2p_done));
+  CUDA_CHECK(cudaEventDestroy(ev_coll_done));
 
   return output;
 }

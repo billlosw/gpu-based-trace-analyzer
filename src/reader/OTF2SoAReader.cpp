@@ -25,11 +25,29 @@ public:
 
   void definitions_done(const otf2::reader::reader &) override {}
 
+  // --- Region Enter callback ---
+  // Track Enter timestamps per location so recv events can use the
+  // enclosing region's Enter time (Scalasca semantics):
+  //   - Blocking MPI_Recv: Enter(MPI_Recv) is when the process starts waiting
+  //   - Non-blocking MPI_Irecv completed in MPI_Wait: Enter(MPI_Wait) is
+  //     when the process starts waiting for the data
+  void event(const otf2::definition::location &loc,
+             const otf2::event::enter &event) override {
+    id_t pid = loc.ref().get();
+    m_last_enter_ts[pid] = extractTimestamp(event.timestamp());
+  }
+
   // --- P2P event callbacks ---
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_send &event) override {
     id_t pid = loc.ref().get();
-    auto ts = extractTimestamp(event.timestamp());
+    // Use Enter(MPI_Send) timestamp for Scalasca-compatible analysis.
+    // The mpi_send point event fires after Enter(MPI_Send), so using
+    // m_last_enter_ts gives the correct Enter timestamp that Scalasca uses.
+    auto it = m_last_enter_ts.find(pid);
+    timestamp_t ts = (it != m_last_enter_ts.end())
+                         ? it->second
+                         : extractTimestamp(event.timestamp());
 
     pushEvent(TT_MPI_Send, ENTER, ts, ts, pid,
               pid, event.receiver(), event.msg_tag(), 0);
@@ -40,9 +58,17 @@ public:
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_receive &event) override {
     id_t pid = loc.ref().get();
-    auto ts = extractTimestamp(event.timestamp());
+    // Use Enter timestamp for Scalasca-compatible analysis.
+    // The mpi_receive point-event fires AFTER the blocking recv completes
+    // (≈ Leave time), but Scalasca compares Enter timestamps on both sides.
+    auto it = m_last_enter_ts.find(pid);
+    timestamp_t enter_ts = (it != m_last_enter_ts.end())
+                               ? it->second
+                               : extractTimestamp(event.timestamp());
+    // Store completion time in end_timestamps for blocking-check in kernel
+    timestamp_t leave_ts = extractTimestamp(event.timestamp());
 
-    pushEvent(TT_MPI_Recv, ENTER, ts, ts, pid,
+    pushEvent(TT_MPI_Recv, ENTER, enter_ts, leave_ts, pid,
               event.sender(), pid, event.msg_tag(), 0);
 
     m_recv_count++;
@@ -51,7 +77,11 @@ public:
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_isend_request &event) override {
     id_t pid = loc.ref().get();
-    auto ts = extractTimestamp(event.timestamp());
+    // Use Enter(MPI_Isend) timestamp for Scalasca-compatible analysis.
+    auto it = m_last_enter_ts.find(pid);
+    timestamp_t ts = (it != m_last_enter_ts.end())
+                         ? it->second
+                         : extractTimestamp(event.timestamp());
 
     pushEvent(TT_MPI_Isend, ENTER, ts, ts, pid,
               pid, event.receiver(), event.msg_tag(), 0);
@@ -62,9 +92,19 @@ public:
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_ireceive_complete &event) override {
     id_t pid = loc.ref().get();
-    auto ts = extractTimestamp(event.timestamp());
+    // Use the Enter timestamp of the enclosing region (typically MPI_Wait)
+    // for Scalasca-compatible analysis. The mpi_ireceive_complete fires
+    // inside Enter(MPI_Wait)/Leave(MPI_Wait), so m_last_enter_ts[pid]
+    // holds Enter(MPI_Wait) — the point when the process starts waiting
+    // for the data, which is what Scalasca uses for late_sender comparison.
+    auto it = m_last_enter_ts.find(pid);
+    timestamp_t enter_ts = (it != m_last_enter_ts.end())
+                               ? it->second
+                               : extractTimestamp(event.timestamp());
+    // Store completion time in end_timestamps for blocking-check in kernel
+    timestamp_t leave_ts = extractTimestamp(event.timestamp());
 
-    pushEvent(TT_MPI_Irecv, ENTER, ts, ts, pid,
+    pushEvent(TT_MPI_Irecv, ENTER, enter_ts, leave_ts, pid,
               event.sender(), pid, event.msg_tag(), 0);
 
     m_recv_count++;
@@ -219,6 +259,9 @@ private:
   // Collective begin/end pairing
   std::unordered_map<id_t, timestamp_t> m_coll_begin_ts;
   std::unordered_map<id_t, bool> m_coll_begin_valid;
+
+  // Last Enter region timestamp per location (for blocking recv and MPI_Wait)
+  std::unordered_map<id_t, timestamp_t> m_last_enter_ts;
 
   // Counts for diagnostics
   size_t m_send_count = 0;

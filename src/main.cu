@@ -149,6 +149,19 @@ int main(int argc, char **argv) {
       std::chrono::duration<double, std::milli>(t2 - t1).count();
   std::cout << "[Timer] Analysis kernels: " << analysis_ms << " ms"
             << std::endl;
+  std::cout << "[Analysis] Sub-phases: H2D=" << std::fixed << std::setprecision(2)
+            << raw.h2d_ms << " ms, P2P kernel=" << raw.p2p_kernel_ms
+            << " ms, Coll kernels=" << raw.coll_kernel_ms << " ms"
+            << std::endl;
+
+  // Bandwidth analysis for P2P kernel
+  if (raw.p2p_kernel_ms > 0) {
+    double bytes_read = (double)reader_output.data.count * (4 + 4 + 8); // events + match + timestamps
+    double bw_gb_s = bytes_read / (raw.p2p_kernel_ms * 1e-3) / 1e9;
+    std::cout << "[Analysis] P2P kernel bandwidth: " << std::fixed
+              << std::setprecision(1) << bw_gb_s << " GB/s (coalesced reads only)"
+              << std::endl;
+  }
 
   // Print raw counts for diagnostics
   std::cout << "[Analysis] Raw counts: "

@@ -17,6 +17,12 @@ struct RawAnalysisOutput {
   std::vector<double> late_broadcast;
   std::vector<double> wait_nxn;
   std::vector<double> nxn_completion;
+
+  // Sub-phase timing (ms)
+  float h2d_ms = 0;
+  float p2p_kernel_ms = 0;
+  float coll_kernel_ms = 0;
+  float d2h_ms = 0;
 };
 
 RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
