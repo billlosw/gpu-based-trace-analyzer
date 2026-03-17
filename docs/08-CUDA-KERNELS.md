@@ -36,12 +36,22 @@ for each event i (grid-stride):
     recv_enter = timestamps[i]
     send_enter = timestamps[send_idx]
 
+    // Late sender (independent check)
     if send_enter > recv_enter:
         pos = atomicAdd(late_sender_cnt, 1)
         late_sender_out[pos] = (double)(send_enter - recv_enter)
-    else if recv_enter > send_enter:
-        pos = atomicAdd(late_receiver_cnt, 1)
-        late_receiver_out[pos] = (double)(recv_enter - send_enter)
+
+    // Late receiver (independent check, NOT mutually exclusive with late sender)
+    #ifdef USE_SCALASCA_TIMESTAMPS:
+        send_leave = end_timestamps[send_idx]   // Leave(MPI_Send)
+        recv_req_enter = end_timestamps[i]      // Enter(MPI_Irecv)
+        if send_leave > recv_req_enter AND recv_req_enter > send_enter:
+            pos = atomicAdd(late_receiver_cnt, 1)
+            late_receiver_out[pos] = (double)(recv_req_enter - send_enter)
+    #else:
+        if recv_enter > send_enter:
+            pos = atomicAdd(late_receiver_cnt, 1)
+            late_receiver_out[pos] = (double)(recv_enter - send_enter)
 ```
 
 **Trick**: Only iterates Recv/Irecv events to avoid double-counting. Each send-recv pair has exactly one Recv event, so each pair is processed exactly once.

@@ -4,7 +4,7 @@ A CUDA-accelerated MPI trace analyzer that reads OTF2 trace files and performs 8
 
 ## Prerequisites
 
-- CUDA Toolkit (12.x recommended, tested with 12.9.0)
+- CUDA Toolkit (12.x recommended, tested with 12.8.0)
 - CMake >= 3.24
 - MPI implementation (OpenMPI 4.x)
 - OTF2 library (3.0.3)

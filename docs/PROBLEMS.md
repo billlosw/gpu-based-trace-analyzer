@@ -2,19 +2,15 @@
 
 ## Bugs / Correctness Issues
 
-### TODO 1: Late Receiver Over-Counting (Known Semantic Mismatch)
+### ~~TODO 1: Late Receiver Over-Counting (Known Semantic Mismatch)~~ [SOLVED 2026-03-17]
 
-**File**: `src/analysis/AnalysisKernels.cu`, `kernelLateSenderReceiver` (line 39-43)
+**File**: `src/analysis/AnalysisKernels.cu`, `kernelLateSenderReceiver`
 
-**Issue**: Late_receiver counts are 3-4x higher than Scalasca. The GPU analyzer classifies ALL matched pairs where `recv_enter > send_enter` as late_receiver. Scalasca only counts pairs where the MPI call actually **blocked** (i.e., the process waited for data that hadn't arrived yet).
+**Issue**: Late_receiver counts were 3-4x higher than Scalasca. The GPU analyzer classified ALL matched pairs where `recv_enter > send_enter` as late_receiver. Scalasca only counts pairs where the sender was still blocked when the receive was posted.
 
-For non-blocking patterns like `MPI_Irecv + MPI_Send + MPI_Wait`, if `MPI_Wait` returns immediately (data already available from an earlier `MPI_Isend`), Scalasca reports no wait state. The GPU analyzer still reports late_receiver because `Enter(MPI_Wait) > Enter(MPI_Send)`.
+**Root Cause**: Two bugs: (1) late_sender and late_receiver were in mutually exclusive `if/else` branches, but Scalasca checks them independently in separate replay callbacks; (2) the wrong timestamps were used — `Enter(MPI_Wait)` instead of `Enter(MPI_Irecv)` for the recv side, and no check on `Leave(MPI_Send)` for the blocking condition.
 
-**Impact**: Late_receiver counts are inflated. Sum/mean are also affected. This is the only analysis that doesn't match Scalasca.
-
-**Possible fix**: Add a blocking check. If `end_timestamps[recv_idx] - timestamps[recv_idx]` is very small (≈ 0), the call returned immediately and should not be counted as late_receiver. However, the exact threshold and semantics need investigation to match Scalasca's model. Scalasca likely uses a more nuanced model that checks whether the send's Leave timestamp is before or after the recv's Enter timestamp.
-
-**Priority**: Medium. The late_sender metric (which matches Scalasca exactly) is the more actionable metric for identifying performance bottlenecks.
+**Solution**: Restructured the kernel so late_receiver is an independent check (not mutually exclusive with late_sender). Under `#ifdef USE_SCALASCA_TIMESTAMPS`, the late_receiver now uses `Enter(MPI_Irecv)` and checks `Leave(MPI_Send) > Enter(MPI_Irecv) > Enter(MPI_Send)`, matching Scalasca's algorithm exactly. Added three new OTF2 reader event handlers (`leave`, `mpi_ireceive_request`) and member variables to populate the required timestamps. All 8 analyses now match Scalasca exactly. See `chat-history/260317-1000-late-receiver-fix.md`.
 
 ---
 
@@ -66,7 +62,7 @@ for (size_t i = 0; i < n; i++) {
 
 ---
 
-### TODO 4: README Contains Wrong CUDA Version
+### ~~TODO 4: README Contains Wrong CUDA Version~~ [SOLVED 2026-03-17]
 
 **File**: `README.md`, line 9
 
@@ -246,3 +242,45 @@ srun --mpi=pmix -n 64 scout.mpi ~/claude/TileTraceClaude/exp/traces/cg.D/traces.
 **Impact**: For CG traces, the H2D transfer is ~20ms and kernels are ~100ms. Overlapping could save ~20ms (16% of GPU phase). Since GPU phase is only ~0.5% of total time, the overall impact is minimal.
 
 **Priority**: Low.
+
+---
+
+### TODO 16: Comm-Set Comparison Uses Vector Equality (Potential Performance Issue)
+
+**File**: `src/matching/CollectiveGrouping.cpp`, `PendingGroup::comm_set_key`
+
+```cpp
+std::vector<uint64_t> comm_set_key;    // Sorted communicator members (for comparison)
+```
+
+**Issue**: The collective grouping algorithm matches events to pending groups by comparing `comm_set_key` vectors element-by-element. For large communicators (e.g., 1024+ members), this O(N) comparison runs for every event against every pending group of the same type. With many concurrent collectives, this becomes O(events * pending_groups * comm_size).
+
+**Impact**: Negligible for current traces (CG uses 64-member communicators with few concurrent collectives). Could become a bottleneck for traces with thousands of processes and many sub-communicators.
+
+**Possible fix**: Replace the sorted vector comparison with a hash of the communicator member set. Pre-compute a hash (e.g., using a commutative hash function like XOR of hashed members, or `std::hash` over the sorted vector) and compare hashes first, with full vector comparison only on hash collision. This reduces the comparison from O(N) to O(1) amortized.
+
+**Priority**: Low (optimization for large-scale traces).
+
+---
+
+### TODO 17: No Per-Event Detail for Max/Min (Missing Scalasca Feature)
+
+**Issue**: Scalasca reports per-cnode detail information for the maximum and minimum events of each metric:
+
+```
+mpi_latesender  719547 0.0071663 0.2515962 0.0000000005 1677.3065939138 ...
+- cnode 24 enter: 41.2452562001 exit: 1718.5532726106 duration: 1677.3065939138 rank: 62
+- cnode 27 enter: 1774.8533962698 exit: 1774.8590713707 duration: 0.0056734995 rank: 60
+```
+
+The GPU analyzer only reports aggregate statistics (count, sum, mean, min, max, median, q25, q75, variance). It does not track which event (cnode, rank, enter/exit timestamps) produced the max or min value for each metric. This information is useful for identifying the specific callsite and rank responsible for the worst performance bottleneck.
+
+**Missing components**:
+1. **No cnode ID in `TraceDataSoA`**: The OTF2 call-tree node concept is not captured during reading.
+2. **Kernels output only durations**: The CUDA kernels write `double` durations to output arrays without the source event index, rank, or cnode.
+3. **`computeStatistics()` does not track min/max index**: When finding min/max, only the value is saved, not which event produced it.
+4. **Output format lacks detail lines**: `printResult()` only prints aggregate stats.
+
+**Possible fix**: (1) Add a `cnode_id` array to `TraceDataSoA`, populated from OTF2 region/callpath definitions during reading. (2) Have kernels output `(duration, event_index)` pairs instead of just durations (e.g., using a struct or parallel index array). (3) In `computeStatistics()`, track the index of min/max values and look up the corresponding cnode, rank, enter, exit from `TraceDataSoA`. (4) Add per-cnode detail lines to the output.
+
+**Priority**: Medium (useful for practical performance analysis, but aggregate stats are sufficient for validation).

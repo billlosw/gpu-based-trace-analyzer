@@ -12,7 +12,9 @@ This document chronicles the key bugs encountered and fixed during development, 
 | 2026-03-14 (PM) | Discovered and fixed TileTrace's tiled replay bug |
 | 2026-03-15 (AM) | Fixed recv-side timestamp semantics (Enter vs point-event) |
 | 2026-03-15 (PM) | Fixed send-side timestamp semantics (Enter vs point-event) |
-| 2026-03-15 (PM) | Achieved exact match with Scalasca on 7/8 analyses |
+| 2026-03-15 (PM) | Achieved exact match with Scalasca on 7/8 analyses (late_receiver pending) |
+| 2026-03-16 | Added timestamp mode selector (SCALASCA / TILETRACE via CMake) |
+| 2026-03-17 | Fixed late_receiver: independent check + correct Scalasca timestamps → 8/8 exact match |
 
 ## Bug 1: Silent CUDA Kernel Failure (CUDA Version Mismatch)
 
@@ -113,3 +115,23 @@ GPU Analyzer: mpi_send_event=1003  vs Enter(MPI_Recv)=1002 → late_sender (fals
 **Root Cause**: The otf2xx submodule was updated to require OTF2 3.1 (`find_package(OTF2 3.1 EXACT)`), but the server only has 3.0.3.
 
 **Fix**: Changed version requirement in otf2xx's CMakeLists and moved compile tests that used 3.1-specific enums behind the test guard.
+
+## Bug 10: Late Receiver Algorithm (Two Bugs)
+
+**Symptom**: late_receiver count was 3-4x higher than Scalasca (818,613 vs 250,643 for CG-B).
+
+**Root Cause**: Two distinct bugs:
+
+1. **Mutually exclusive branching**: The CUDA kernel had late_sender and late_receiver in `if/else` branches. Scalasca checks them independently in separate replay callbacks (`post_recv` for late_sender, `post_send_bws` for late_receiver).
+
+2. **Wrong timestamps**: The kernel used `Enter(MPI_Wait)` as the recv timestamp and didn't check the `Leave(MPI_Send)` blocking condition. Scalasca uses `Enter(MPI_Irecv)` (when the receive request was posted) and requires `Leave(MPI_Send) > Enter(MPI_Irecv)` (sender still blocked when recv was posted).
+
+**Fix**:
+- Restructured `kernelLateSenderReceiver`: late_receiver is now an independent check, not mutually exclusive with late_sender.
+- Under `#ifdef USE_SCALASCA_TIMESTAMPS`, the late_receiver condition is `Leave(MPI_Send) > Enter(MPI_Irecv) > Enter(MPI_Send)`, with duration `Enter(MPI_Irecv) - Enter(MPI_Send)`.
+- Added three new OTF2 reader event handlers: `leave` (to capture `Leave(MPI_Send)`), `mpi_ireceive_request` (to capture `Enter(MPI_Irecv)`), plus `m_last_send_soa_idx` tracking.
+- Added three new member variables: `m_last_leave_ts`, `m_irecv_enter_ts`, `m_last_send_soa_idx`.
+
+**Result**: All 8 analyses now match Scalasca exactly (count, sum, max) on both CG-B and CG-C.
+
+**Lesson**: Scalasca uses `pearl::timestamp_t = double` (signed), so subtractions can go negative and filter naturally. Our `uint64_t` timestamps require explicit `>` guards to prevent unsigned underflow.

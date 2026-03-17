@@ -24,7 +24,9 @@ The gap between `Enter` and the point event includes Score-P's instrumentation o
 | `MPI_Send` (blocking) | `Enter(MPI_Send)` | `m_last_enter_ts[pid]` from `event(enter)` callback |
 | `MPI_Isend` (non-blocking) | `Enter(MPI_Isend)` | `m_last_enter_ts[pid]` from `event(enter)` callback |
 | `MPI_Recv` (blocking) | `Enter(MPI_Recv)` | `m_last_enter_ts[pid]` from `event(enter)` callback |
-| `MPI_Irecv` + `MPI_Wait` | `Enter(MPI_Wait)` | `m_last_enter_ts[pid]` — the `mpi_ireceive_complete` event fires inside `Enter(MPI_Wait)/Leave(MPI_Wait)`, so `m_last_enter_ts` holds `Enter(MPI_Wait)` |
+| `MPI_Irecv` + `MPI_Wait` | `Enter(MPI_Wait)` (for late_sender) | `m_last_enter_ts[pid]` — the `mpi_ireceive_complete` event fires inside `Enter(MPI_Wait)/Leave(MPI_Wait)`, so `m_last_enter_ts` holds `Enter(MPI_Wait)` |
+| `MPI_Irecv` (for late_receiver, Scalasca mode) | `Enter(MPI_Irecv)` | `m_irecv_enter_ts[pid]` — saved by `mpi_ireceive_request` handler, stored in `end_timestamps` by `mpi_ireceive_complete` handler |
+| `MPI_Send` Leave (for late_receiver, Scalasca mode) | `Leave(MPI_Send)` | `m_last_leave_ts[pid]` — updated in `leave` handler, written to `end_timestamps[send_idx]` via `m_last_send_soa_idx` |
 | Collective (begin/end) | `mpi_collective_begin` timestamp | Directly from the point event (begin marks when the process enters the collective) |
 
 ### Why Not Point-Event Timestamps?
@@ -58,15 +60,33 @@ For each matched Recv event i:
 
 ## Analysis 2: Late Receiver
 
-**Purpose**: Detect when the receiver arrived at its MPI_Recv/MPI_Wait after the sender had already called MPI_Send.
+**Purpose**: Detect when the receiver posted its receive request after the sender had already started its MPI_Send, and the sender was still blocked when the receive was posted.
 
-**Formula**: `recv_enter - send_enter` when `recv_enter > send_enter`
+**Formula** (Scalasca mode, default):
+```
+Condition: Leave(MPI_Send) > Enter(MPI_Irecv) AND Enter(MPI_Irecv) > Enter(MPI_Send)
+Duration:  Enter(MPI_Irecv) - Enter(MPI_Send)
+```
 
-**Implementation**: Same kernel as Late Sender, opposite branch.
+For blocking `MPI_Recv`, `Enter(MPI_Recv)` is used instead of `Enter(MPI_Irecv)`.
 
-**Scalasca match**: Over-counts by 3-4x. Our tool classifies ALL pairs where `recv_enter > send_enter` as late_receiver. Scalasca only counts pairs where the MPI call actually blocked (i.e., had nonzero wait time). For CG's `MPI_Irecv + MPI_Send + MPI_Wait` pattern, many `MPI_Wait` calls return immediately because data already arrived, but our tool still counts them as late_receiver.
+**Implementation** (in `kernelLateSenderReceiver`, `#ifdef USE_SCALASCA_TIMESTAMPS`):
+```
+For each matched Recv event i:
+    send_idx = match_partner[i]
+    send_enter = timestamps[send_idx]       // Enter(MPI_Send)
+    send_leave = end_timestamps[send_idx]   // Leave(MPI_Send)
+    recv_req_enter = end_timestamps[i]      // Enter(MPI_Irecv) or Enter(MPI_Recv)
 
-**Why this is acceptable**: The late_sender metric is the one that identifies genuine performance bottlenecks (the receiver was waiting and the sender was slow). Late_receiver is less actionable — it just means the receiver started waiting after the sender sent, which is often the expected/normal case.
+    if (send_leave > recv_req_enter AND recv_req_enter > send_enter):
+        late_receiver_duration = recv_req_enter - send_enter
+```
+
+**Key**: Late receiver is checked **independently** from late sender (not in a mutually exclusive `if/else` branch). A single P2P pair can contribute to both late_sender and late_receiver, matching Scalasca's separate replay callbacks.
+
+**Scalasca match**: **EXACT** (count, sum, max). Fixed on 2026-03-17; see `chat-history/260317-1000-late-receiver-fix.md` for details.
+
+**History**: The original implementation had two bugs: (1) late_sender and late_receiver were in mutually exclusive `if/else` branches, but Scalasca checks them independently; (2) it used `Enter(MPI_Wait)` as the recv timestamp instead of `Enter(MPI_Irecv)`, and did not check the `Leave(MPI_Send)` blocking condition. Both were fixed by restructuring the kernel and adding new OTF2 reader event handlers (`leave`, `mpi_ireceive_request`).
 
 ## Analysis 3: Barrier Wait
 
@@ -173,7 +193,7 @@ Multiple values per group (one per early-arriving member).
 
 | Kernel | Analyses | Strategy |
 |--------|----------|----------|
-| `kernelLateSenderReceiver` | Late Sender + Late Receiver | One thread per event, grid-stride loop |
+| `kernelLateSenderReceiver` | Late Sender + Late Receiver (independent checks) | One thread per event, grid-stride loop |
 | `kernelBarrierWaitCompletion` | Barrier Wait + Barrier Completion | One block per group, thread 0 sequential |
 | `kernelEarlyReduce` | Early Reduce | One block per group, thread 0 sequential |
 | `kernelLateBroadcast` | Late Broadcast | One block per group, thread 0 sequential |

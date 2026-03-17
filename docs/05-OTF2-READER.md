@@ -25,9 +25,11 @@ class SoAReaderCallback : public otf2::reader::callback {
 
     // Event callbacks
     void event(const otf2::definition::location &, const otf2::event::enter &) override;
+    void event(const otf2::definition::location &, const otf2::event::leave &) override;  // Scalasca mode
     void event(const otf2::definition::location &, const otf2::event::mpi_send &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_receive &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_isend_request &) override;
+    void event(const otf2::definition::location &, const otf2::event::mpi_ireceive_request &) override;  // Scalasca mode
     void event(const otf2::definition::location &, const otf2::event::mpi_ireceive_complete &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_collective_begin &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_collective_end &) override;
@@ -141,28 +143,66 @@ void event(const otf2::definition::location &loc,
 
 This is used by send/recv handlers to get the Enter timestamp instead of the point-event timestamp. The `enter` callback fires for every region entry (MPI_Send, MPI_Recv, MPI_Wait, etc.), so `m_last_enter_ts` always holds the most recent one when a point event fires.
 
+### Leave Timestamp and Send SoA Index Tracking (Scalasca Mode)
+
+Under `#ifdef USE_SCALASCA_TIMESTAMPS`, the reader also captures additional state needed for the late_receiver analysis:
+
+```cpp
+// Leave handler — captures Leave(MPI_Send) for late_receiver condition
+void event(const otf2::definition::location &loc,
+           const otf2::event::leave &event) override {
+    id_t pid = loc.ref().get();
+    m_last_leave_ts[pid] = extractTimestamp(event.timestamp());
+    // If this Leave follows a Send, update the send's end_timestamps
+    auto it = m_last_send_soa_idx.find(pid);
+    if (it != m_last_send_soa_idx.end() && it->second >= 0) {
+        m_v_end_timestamps[it->second] = m_last_leave_ts[pid];
+        it->second = -1;  // Reset
+    }
+}
+
+// mpi_ireceive_request handler — saves Enter(MPI_Irecv) timestamp
+void event(const otf2::definition::location &loc,
+           const otf2::event::mpi_ireceive_request &event) override {
+    id_t pid = loc.ref().get();
+    m_irecv_enter_ts[pid] = m_last_enter_ts[pid];
+}
+```
+
+The send handlers (`mpi_send`, `mpi_isend_request`) record their SoA index in `m_last_send_soa_idx[pid]` so the subsequent Leave callback can write `Leave(MPI_Send)` into the correct `end_timestamps` entry.
+
+The `mpi_ireceive_complete` handler stores `m_irecv_enter_ts[pid]` (i.e., `Enter(MPI_Irecv)`) into `end_timestamps[i]` for the recv event, repurposing this field for the late_receiver check.
+
+New member variables (under `#ifdef USE_SCALASCA_TIMESTAMPS`):
+- `m_last_leave_ts` — Last Leave timestamp per location
+- `m_irecv_enter_ts` — Enter(MPI_Irecv) timestamp per location
+- `m_last_send_soa_idx` — SoA index of last send event per location
+
 ### P2P Event Field Mapping
 
 For send events:
 ```
-events[i]     = TT_MPI_Send or TT_MPI_Isend
-timestamps[i] = Enter(MPI_Send) or Enter(MPI_Isend)
-pids[i]       = sender rank
-srcs[i]       = sender rank (= pids[i])
-dsts[i]       = receiver rank
-tags[i]       = message tag
+events[i]         = TT_MPI_Send or TT_MPI_Isend
+timestamps[i]     = Enter(MPI_Send) or Enter(MPI_Isend)
+end_timestamps[i] = Leave(MPI_Send) or Leave(MPI_Isend)  [Scalasca mode only]
+pids[i]           = sender rank
+srcs[i]           = sender rank (= pids[i])
+dsts[i]           = receiver rank
+tags[i]           = message tag
 ```
 
 For recv events:
 ```
 events[i]         = TT_MPI_Recv or TT_MPI_Irecv
 timestamps[i]     = Enter(MPI_Recv) or Enter(MPI_Wait)
-end_timestamps[i] = point-event timestamp (completion time)
+end_timestamps[i] = Enter(MPI_Irecv) [Scalasca mode] or point-event timestamp [non-Scalasca]
 pids[i]           = receiver rank
 srcs[i]           = sender rank
 dsts[i]           = receiver rank (= pids[i])
 tags[i]           = message tag
 ```
+
+**Note** (Scalasca mode): For send events, `end_timestamps` holds `Leave(MPI_Send)`, used for the late_receiver blocking condition. For recv events, `end_timestamps` holds `Enter(MPI_Irecv)` (the time the receive request was posted), used as the recv timestamp in the late_receiver formula.
 
 **Key**: For both sends and receives, the matching key is `(srcs[i], dsts[i], tags[i])` = `(sender_rank, receiver_rank, tag)`.
 

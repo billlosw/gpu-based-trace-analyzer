@@ -86,10 +86,10 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
 
 ## Validation Status
 
-7 of 8 analyses **match Scalasca exactly** (count and sum within 1 picosecond of floating point rounding):
-- late_sender, barrier_wait, barrier_completion, early_reduce, late_broadcast, wait_nxn, nxn_completion
+All 8 analyses **match Scalasca exactly** (count and sum within 1 picosecond of floating point rounding):
+- late_sender, late_receiver, barrier_wait, barrier_completion, early_reduce, late_broadcast, wait_nxn, nxn_completion
 
-The remaining analysis (**late_receiver**) over-counts because the tool classifies ALL pairs where `recv_enter > send_enter` as late_receiver, while Scalasca only counts pairs where the MPI call actually blocked (nonzero wait state). See [ANALYSIS-DETAILS.md](./03-ANALYSIS-DETAILS.md) for full explanation.
+Validated on CG Class B and CG Class C traces (64 locations). See [09-TESTING.md](./09-TESTING.md) for detailed results.
 
 ## Documentation Index
 
