@@ -32,15 +32,38 @@ kernelLateSenderReceiver(const event_t *__restrict__ events,
     timestamp_t recv_enter = timestamps[i];
     timestamp_t send_enter = timestamps[send_idx];
 
+    // Late sender: sender arrived after receiver started waiting.
+    // Scalasca: idle = min(Enter(MPI_Send), Leave(MPI_Recv/Wait)) - Enter(MPI_Recv/Wait)
+    // Simplified: idle = Enter(MPI_Send) - Enter(MPI_Recv/Wait) when > 0
     if (send_enter > recv_enter) {
-      // Late sender: sender arrived after receiver started waiting.
       unsigned int pos = atomicAdd(late_sender_cnt, 1u);
       late_sender_out[pos] = (double)(send_enter - recv_enter);
-    } else if (recv_enter > send_enter) {
-      // Late receiver: receiver arrived after sender.
+    }
+
+#ifdef USE_SCALASCA_TIMESTAMPS
+    // Late receiver (independent check, NOT mutually exclusive with late sender).
+    // Scalasca algorithm (SCOUT Patterns_gen.cpp lines 2819-2843):
+    //   enter_sendcmp = Enter(send completion) = Enter(MPI_Send) for blocking
+    //   leave_sendcmp = Leave(send completion) = Leave(MPI_Send) for blocking
+    //   enter_recvreq = Enter(recv request)    = Enter(MPI_Irecv) for non-blocking
+    //                                          = Enter(MPI_Recv) for blocking
+    // Condition: leave_sendcmp > enter_recvreq (sender still blocked when recv posted)
+    // Duration:  enter_recvreq - enter_sendcmp (only counted when > 0)
+    {
+      timestamp_t send_leave = end_timestamps[send_idx];   // Leave(MPI_Send)
+      timestamp_t recv_req_enter = end_timestamps[i];      // Enter(MPI_Irecv) or Enter(MPI_Recv)
+      if (send_leave > recv_req_enter && recv_req_enter > send_enter) {
+        unsigned int pos = atomicAdd(late_receiver_cnt, 1u);
+        late_receiver_out[pos] = (double)(recv_req_enter - send_enter);
+      }
+    }
+#else
+    // Non-Scalasca mode: simple late receiver check
+    if (recv_enter > send_enter) {
       unsigned int pos = atomicAdd(late_receiver_cnt, 1u);
       late_receiver_out[pos] = (double)(recv_enter - send_enter);
     }
+#endif
   }
 }
 

@@ -131,6 +131,7 @@ int main(int argc, char **argv) {
   double match_ms =
       std::chrono::duration<double, std::milli>(t2 - t1).count();
   std::cout << "[Timer] P2P matching: " << match_ms << " ms" << std::endl;
+
   std::cout << std::endl;
 
   // Step 3: Collective Grouping on CPU

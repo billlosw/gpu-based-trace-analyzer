@@ -37,6 +37,21 @@ public:
     id_t pid = loc.ref().get();
     m_last_enter_ts[pid] = extractTimestamp(event.timestamp());
   }
+
+  // Track Leave timestamps per location. For sends, the Leave(MPI_Send)
+  // is the actual completion time Scalasca uses for late_receiver condition.
+  void event(const otf2::definition::location &loc,
+             const otf2::event::leave &event) override {
+    id_t pid = loc.ref().get();
+    m_last_leave_ts[pid] = extractTimestamp(event.timestamp());
+    // If we have a pending send event for this location, update its
+    // end_timestamp with the actual Leave time.
+    auto it = m_last_send_soa_idx.find(pid);
+    if (it != m_last_send_soa_idx.end() && it->second >= 0) {
+      m_v_end_timestamps[it->second] = m_last_leave_ts[pid];
+      it->second = -1; // Clear pending flag
+    }
+  }
 #endif
 
   // --- P2P event callbacks ---
@@ -45,18 +60,25 @@ public:
     id_t pid = loc.ref().get();
 #ifdef USE_SCALASCA_TIMESTAMPS
     // Use Enter(MPI_Send) timestamp for Scalasca-compatible analysis.
-    // The mpi_send point event fires after Enter(MPI_Send), so using
-    // m_last_enter_ts gives the correct Enter timestamp that Scalasca uses.
     auto it = m_last_enter_ts.find(pid);
-    timestamp_t ts = (it != m_last_enter_ts.end())
-                         ? it->second
-                         : extractTimestamp(event.timestamp());
+    timestamp_t enter_ts = (it != m_last_enter_ts.end())
+                               ? it->second
+                               : extractTimestamp(event.timestamp());
+    // Temporarily store mpi_send event timestamp as end_timestamps placeholder.
+    // The Leave callback will overwrite this with the actual Leave(MPI_Send).
+    timestamp_t leave_ts = extractTimestamp(event.timestamp());
+
+    size_t soa_idx = m_v_events.size();
+    pushEvent(TT_MPI_Send, ENTER, enter_ts, leave_ts, pid,
+              pid, event.receiver(), event.msg_tag(), 0);
+    // Mark this SoA index so the Leave callback can update end_timestamps
+    m_last_send_soa_idx[pid] = (int64_t)soa_idx;
 #else
     auto ts = extractTimestamp(event.timestamp());
-#endif
 
     pushEvent(TT_MPI_Send, ENTER, ts, ts, pid,
               pid, event.receiver(), event.msg_tag(), 0);
+#endif
 
     m_send_count++;
   }
@@ -72,10 +94,10 @@ public:
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
-    // Store completion time in end_timestamps for blocking-check in kernel
-    timestamp_t leave_ts = extractTimestamp(event.timestamp());
-
-    pushEvent(TT_MPI_Recv, ENTER, enter_ts, leave_ts, pid,
+    // For blocking MPI_Recv, the recv "request" and "completion" are the same
+    // region. Store Enter(MPI_Recv) in end_timestamps for late_receiver
+    // consistency with the non-blocking case (where end_ts = Enter(MPI_Irecv)).
+    pushEvent(TT_MPI_Recv, ENTER, enter_ts, enter_ts, pid,
               event.sender(), pid, event.msg_tag(), 0);
 #else
     auto ts = extractTimestamp(event.timestamp());
@@ -93,36 +115,57 @@ public:
 #ifdef USE_SCALASCA_TIMESTAMPS
     // Use Enter(MPI_Isend) timestamp for Scalasca-compatible analysis.
     auto it = m_last_enter_ts.find(pid);
-    timestamp_t ts = (it != m_last_enter_ts.end())
-                         ? it->second
-                         : extractTimestamp(event.timestamp());
+    timestamp_t enter_ts = (it != m_last_enter_ts.end())
+                               ? it->second
+                               : extractTimestamp(event.timestamp());
+    timestamp_t leave_ts = extractTimestamp(event.timestamp());
+
+    size_t soa_idx = m_v_events.size();
+    pushEvent(TT_MPI_Isend, ENTER, enter_ts, leave_ts, pid,
+              pid, event.receiver(), event.msg_tag(), 0);
+    m_last_send_soa_idx[pid] = (int64_t)soa_idx;
 #else
     auto ts = extractTimestamp(event.timestamp());
-#endif
 
     pushEvent(TT_MPI_Isend, ENTER, ts, ts, pid,
               pid, event.receiver(), event.msg_tag(), 0);
+#endif
 
     m_send_count++;
   }
+
+#ifdef USE_SCALASCA_TIMESTAMPS
+  // --- mpi_ireceive_request: save Enter(MPI_Irecv) for late_receiver ---
+  // Scalasca's late_receiver uses Enter(MPI_Irecv) (the recv request enter),
+  // NOT Enter(MPI_Wait). We save it here so mpi_ireceive_complete can use it.
+  void event(const otf2::definition::location &loc,
+             const otf2::event::mpi_ireceive_request &event) override {
+    id_t pid = loc.ref().get();
+    // m_last_enter_ts[pid] currently holds Enter(MPI_Irecv)
+    auto it = m_last_enter_ts.find(pid);
+    if (it != m_last_enter_ts.end()) {
+      m_irecv_enter_ts[pid] = it->second;
+    }
+  }
+#endif
 
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_ireceive_complete &event) override {
     id_t pid = loc.ref().get();
 #ifdef USE_SCALASCA_TIMESTAMPS
-    // Use the Enter timestamp of the enclosing region (typically MPI_Wait)
-    // for Scalasca-compatible analysis. The mpi_ireceive_complete fires
-    // inside Enter(MPI_Wait)/Leave(MPI_Wait), so m_last_enter_ts[pid]
-    // holds Enter(MPI_Wait) — the point when the process starts waiting
-    // for the data, which is what Scalasca uses for late_sender comparison.
+    // timestamps[i] = Enter(MPI_Wait) — used for late_sender comparison.
     auto it = m_last_enter_ts.find(pid);
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
-    // Store completion time in end_timestamps for blocking-check in kernel
-    timestamp_t leave_ts = extractTimestamp(event.timestamp());
+    // end_timestamps[i] = Enter(MPI_Irecv) — used for late_receiver comparison.
+    // Scalasca's late_receiver uses Enter(recv_request) = Enter(MPI_Irecv).
+    auto it2 = m_irecv_enter_ts.find(pid);
+    timestamp_t irecv_enter_ts = (it2 != m_irecv_enter_ts.end())
+                                     ? it2->second
+                                     : enter_ts;
 
-    pushEvent(TT_MPI_Irecv, ENTER, enter_ts, leave_ts, pid,
+    pushEvent(TT_MPI_Irecv, ENTER, enter_ts, irecv_enter_ts, pid,
               event.sender(), pid, event.msg_tag(), 0);
 #else
     auto ts = extractTimestamp(event.timestamp());
@@ -287,6 +330,16 @@ private:
 #ifdef USE_SCALASCA_TIMESTAMPS
   // Last Enter region timestamp per location (for blocking recv and MPI_Wait)
   std::unordered_map<id_t, timestamp_t> m_last_enter_ts;
+  // Enter(MPI_Irecv) timestamp per location — saved when mpi_ireceive_request
+  // fires, used later by mpi_ireceive_complete for late_receiver analysis.
+  // Scalasca's late_receiver compares Enter(MPI_Irecv) with Enter(MPI_Send).
+  std::unordered_map<id_t, timestamp_t> m_irecv_enter_ts;
+  // Last Leave timestamp per location (for capturing Leave(MPI_Send))
+  std::unordered_map<id_t, timestamp_t> m_last_leave_ts;
+  // SoA index of last send event per location, so the Leave callback can
+  // update end_timestamps with the actual Leave(MPI_Send) timestamp.
+  // Value -1 means no pending send.
+  std::unordered_map<id_t, int64_t> m_last_send_soa_idx;
 #endif
 
   // Counts for diagnostics
