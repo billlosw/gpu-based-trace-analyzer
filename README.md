@@ -86,7 +86,7 @@ This produces:
 
 ```bash
 # Allocate a GPU node and run
-srun --gres=gpu:4090:1 -n 1 ./build/gpu_analyzer /path/to/scorep_cg_64_trace/traces.otf2
+srun --gres=gpu:4090:1 -n 32 ./build/gpu_analyzer /path/to/scorep_cg_64_trace/traces.otf2
 ```
 
 ### Running Tests
@@ -143,12 +143,12 @@ Plus a timing summary showing per-phase durations.
 
 Run TileTrace on the same trace:
 ```bash
-srun -n 4 ./analysis_integration_test /path/to/traces.otf2
+srun -n 32 ./analysis_integration_test /path/to/traces.otf2
 ```
 
 Run GPU analyzer:
 ```bash
-srun --gres=gpu:4090:1 -n 1 ./gpu_analyzer /path/to/traces.otf2
+srun --gres=gpu:4090:1 -n 32 ./gpu_analyzer /path/to/traces.otf2
 ```
 
 Compare the Count/Mean/Sum/Min/Max values for each of the 8 analyses.

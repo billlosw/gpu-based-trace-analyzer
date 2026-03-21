@@ -3,22 +3,120 @@
 #include <chrono>
 #include <iostream>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <mpi.h>
 #include <otf2xx/otf2.hpp>
 
-// Internal callback class for otf2xx reader — single-pass using vectors
-class SoAReaderCallback : public otf2::reader::callback {
-public:
-  SoAReaderCallback(otf2::reader::reader &rdr, int rank = 0, int size = 1)
-      : m_rdr(rdr), m_rank(rank), m_size(size) {}
+// ============================================================
+// Helper: contiguous block assignment (handles remainder)
+// ============================================================
+static std::pair<id_t, id_t> traceRange(id_t nlocs, id_t nprocs, id_t rank) {
+  id_t per_rank = nlocs / nprocs;
+  id_t remainder = nlocs % nprocs;
+  id_t start, end;
+  if (rank < remainder) {
+    start = rank * (per_rank + 1);
+    end = start + per_rank + 1;
+  } else {
+    start = remainder * (per_rank + 1) + (rank - remainder) * per_rank;
+    end = start + per_rank;
+  }
+  return {start, end};
+}
 
-  // --- Definition callbacks ---
+// Inverse of traceRange: which rank owns a given location?
+static id_t owningRank(id_t nlocs, id_t nprocs, id_t loc_id) {
+  id_t per_rank = nlocs / nprocs;
+  id_t remainder = nlocs % nprocs;
+  id_t boundary = remainder * (per_rank + 1);
+  if (loc_id < boundary) {
+    return loc_id / (per_rank + 1);
+  } else {
+    return remainder + (loc_id - boundary) / per_rank;
+  }
+}
+
+static timestamp_t extractTimestamp(const otf2::chrono::time_point &tp) {
+  auto ts_ps = std::chrono::time_point_cast<otf2::chrono::picoseconds>(tp);
+  return ts_ps.time_since_epoch().count();
+}
+
+// ============================================================
+// Pass 1: Discovery callback — finds communication partners
+// ============================================================
+class Pass1DiscoveryCallback : public otf2::reader::callback {
+public:
+  Pass1DiscoveryCallback(otf2::reader::reader &rdr, id_t start_loc,
+                         id_t end_loc,
+                         std::unordered_set<id_t> &related_locs)
+      : m_rdr(rdr), m_start(start_loc), m_end(end_loc),
+        m_related(related_locs) {}
+
   void definition(const otf2::definition::location &loc) override {
-    uint64_t loc_id = loc.ref().get();
-    // Each rank registers only its assigned locations (round-robin)
-    if ((int)(loc_id % m_size) == m_rank) {
+    id_t lid = loc.ref().get();
+    if (lid >= m_start && lid < m_end) {
+      m_related.insert(lid);
+      m_rdr.register_location(loc);
+    }
+  }
+
+  void definitions_done(const otf2::reader::reader &) override {}
+
+  void event(const otf2::definition::location &,
+             const otf2::event::mpi_send &event) override {
+    m_related.insert(event.receiver());
+  }
+
+  void event(const otf2::definition::location &,
+             const otf2::event::mpi_isend_request &event) override {
+    m_related.insert(event.receiver());
+  }
+
+  void events_done(const otf2::reader::reader &) override {}
+
+private:
+  otf2::reader::reader &m_rdr;
+  id_t m_start, m_end;
+  std::unordered_set<id_t> &m_related;
+};
+
+// ============================================================
+// Collective redistribution buffers (per target rank)
+// ============================================================
+struct CollRedistBuffers {
+  int nprocs;
+  std::vector<std::vector<int>> op_types;
+  std::vector<std::vector<uint64_t>> begin_ts;
+  std::vector<std::vector<uint64_t>> end_ts;
+  std::vector<std::vector<uint32_t>> roots;
+  std::vector<std::vector<uint32_t>> pids;
+  std::vector<std::vector<uint64_t>> flat_comm_sets; // [size, m0, m1, ...]
+
+  CollRedistBuffers(int np)
+      : nprocs(np), op_types(np), begin_ts(np), end_ts(np), roots(np),
+        pids(np), flat_comm_sets(np) {}
+};
+
+// ============================================================
+// Pass 2: Data loading callback — reads events into SoA vectors
+// ============================================================
+class Pass2DataCallback : public otf2::reader::callback {
+public:
+  Pass2DataCallback(otf2::reader::reader &rdr,
+                    const std::unordered_set<id_t> &related_locs,
+                    id_t start_loc, id_t end_loc, id_t nlocs, int rank,
+                    int nprocs, CollRedistBuffers &redist)
+      : m_rdr(rdr), m_related(related_locs), m_start(start_loc),
+        m_end(end_loc), m_nlocs(nlocs), m_rank(rank), m_nprocs(nprocs),
+        m_redist(redist) {}
+
+  // --- Definition: register own + related locations ---
+  void definition(const otf2::definition::location &loc) override {
+    id_t lid = loc.ref().get();
+    if (m_related.count(lid)) {
       m_rdr.register_location(loc);
     }
   }
@@ -26,122 +124,99 @@ public:
   void definitions_done(const otf2::reader::reader &) override {}
 
 #ifdef USE_SCALASCA_TIMESTAMPS
-  // --- Region Enter callback ---
-  // Track Enter timestamps per location so recv events can use the
-  // enclosing region's Enter time (Scalasca semantics):
-  //   - Blocking MPI_Recv: Enter(MPI_Recv) is when the process starts waiting
-  //   - Non-blocking MPI_Irecv completed in MPI_Wait: Enter(MPI_Wait) is
-  //     when the process starts waiting for the data
   void event(const otf2::definition::location &loc,
              const otf2::event::enter &event) override {
     id_t pid = loc.ref().get();
     m_last_enter_ts[pid] = extractTimestamp(event.timestamp());
   }
 
-  // Track Leave timestamps per location. For sends, the Leave(MPI_Send)
-  // is the actual completion time Scalasca uses for late_receiver condition.
   void event(const otf2::definition::location &loc,
              const otf2::event::leave &event) override {
     id_t pid = loc.ref().get();
     m_last_leave_ts[pid] = extractTimestamp(event.timestamp());
-    // If we have a pending send event for this location, update its
-    // end_timestamp with the actual Leave time.
     auto it = m_last_send_soa_idx.find(pid);
     if (it != m_last_send_soa_idx.end() && it->second >= 0) {
       m_v_end_timestamps[it->second] = m_last_leave_ts[pid];
-      it->second = -1; // Clear pending flag
+      it->second = -1;
     }
   }
 #endif
 
-  // --- P2P event callbacks ---
+  // --- P2P: store sends only from own locations ---
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_send &event) override {
     id_t pid = loc.ref().get();
+    if (pid < m_start || pid >= m_end)
+      return;
+
 #ifdef USE_SCALASCA_TIMESTAMPS
-    // Use Enter(MPI_Send) timestamp for Scalasca-compatible analysis.
     auto it = m_last_enter_ts.find(pid);
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
-    // Temporarily store mpi_send event timestamp as end_timestamps placeholder.
-    // The Leave callback will overwrite this with the actual Leave(MPI_Send).
     timestamp_t leave_ts = extractTimestamp(event.timestamp());
-
     size_t soa_idx = m_v_events.size();
-    pushEvent(TT_MPI_Send, ENTER, enter_ts, leave_ts, pid,
-              pid, event.receiver(), event.msg_tag(), 0);
-    // Mark this SoA index so the Leave callback can update end_timestamps
+    pushEvent(TT_MPI_Send, ENTER, enter_ts, leave_ts, pid, pid,
+              event.receiver(), event.msg_tag(), 0);
     m_last_send_soa_idx[pid] = (int64_t)soa_idx;
 #else
     auto ts = extractTimestamp(event.timestamp());
-
-    pushEvent(TT_MPI_Send, ENTER, ts, ts, pid,
-              pid, event.receiver(), event.msg_tag(), 0);
+    pushEvent(TT_MPI_Send, ENTER, ts, ts, pid, pid, event.receiver(),
+              event.msg_tag(), 0);
 #endif
-
     m_send_count++;
   }
 
+  // --- P2P: store recvs only where sender is in own range ---
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_receive &event) override {
+    if (event.sender() < m_start || event.sender() >= m_end)
+      return;
+
     id_t pid = loc.ref().get();
 #ifdef USE_SCALASCA_TIMESTAMPS
-    // Use Enter timestamp for Scalasca-compatible analysis.
-    // The mpi_receive point-event fires AFTER the blocking recv completes
-    // (≈ Leave time), but Scalasca compares Enter timestamps on both sides.
     auto it = m_last_enter_ts.find(pid);
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
-    // For blocking MPI_Recv, the recv "request" and "completion" are the same
-    // region. Store Enter(MPI_Recv) in end_timestamps for late_receiver
-    // consistency with the non-blocking case (where end_ts = Enter(MPI_Irecv)).
-    pushEvent(TT_MPI_Recv, ENTER, enter_ts, enter_ts, pid,
-              event.sender(), pid, event.msg_tag(), 0);
+    pushEvent(TT_MPI_Recv, ENTER, enter_ts, enter_ts, pid, event.sender(), pid,
+              event.msg_tag(), 0);
 #else
     auto ts = extractTimestamp(event.timestamp());
-
-    pushEvent(TT_MPI_Recv, ENTER, ts, ts, pid,
-              event.sender(), pid, event.msg_tag(), 0);
+    pushEvent(TT_MPI_Recv, ENTER, ts, ts, pid, event.sender(), pid,
+              event.msg_tag(), 0);
 #endif
-
     m_recv_count++;
   }
 
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_isend_request &event) override {
     id_t pid = loc.ref().get();
+    if (pid < m_start || pid >= m_end)
+      return;
+
 #ifdef USE_SCALASCA_TIMESTAMPS
-    // Use Enter(MPI_Isend) timestamp for Scalasca-compatible analysis.
     auto it = m_last_enter_ts.find(pid);
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
     timestamp_t leave_ts = extractTimestamp(event.timestamp());
-
     size_t soa_idx = m_v_events.size();
-    pushEvent(TT_MPI_Isend, ENTER, enter_ts, leave_ts, pid,
-              pid, event.receiver(), event.msg_tag(), 0);
+    pushEvent(TT_MPI_Isend, ENTER, enter_ts, leave_ts, pid, pid,
+              event.receiver(), event.msg_tag(), 0);
     m_last_send_soa_idx[pid] = (int64_t)soa_idx;
 #else
     auto ts = extractTimestamp(event.timestamp());
-
-    pushEvent(TT_MPI_Isend, ENTER, ts, ts, pid,
-              pid, event.receiver(), event.msg_tag(), 0);
+    pushEvent(TT_MPI_Isend, ENTER, ts, ts, pid, pid, event.receiver(),
+              event.msg_tag(), 0);
 #endif
-
     m_send_count++;
   }
 
 #ifdef USE_SCALASCA_TIMESTAMPS
-  // --- mpi_ireceive_request: save Enter(MPI_Irecv) for late_receiver ---
-  // Scalasca's late_receiver uses Enter(MPI_Irecv) (the recv request enter),
-  // NOT Enter(MPI_Wait). We save it here so mpi_ireceive_complete can use it.
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_ireceive_request &event) override {
     id_t pid = loc.ref().get();
-    // m_last_enter_ts[pid] currently holds Enter(MPI_Irecv)
     auto it = m_last_enter_ts.find(pid);
     if (it != m_last_enter_ts.end()) {
       m_irecv_enter_ts[pid] = it->second;
@@ -151,44 +226,45 @@ public:
 
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_ireceive_complete &event) override {
+    if (event.sender() < m_start || event.sender() >= m_end)
+      return;
+
     id_t pid = loc.ref().get();
 #ifdef USE_SCALASCA_TIMESTAMPS
-    // timestamps[i] = Enter(MPI_Wait) — used for late_sender comparison.
     auto it = m_last_enter_ts.find(pid);
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
-    // end_timestamps[i] = Enter(MPI_Irecv) — used for late_receiver comparison.
-    // Scalasca's late_receiver uses Enter(recv_request) = Enter(MPI_Irecv).
     auto it2 = m_irecv_enter_ts.find(pid);
-    timestamp_t irecv_enter_ts = (it2 != m_irecv_enter_ts.end())
-                                     ? it2->second
-                                     : enter_ts;
-
+    timestamp_t irecv_enter_ts =
+        (it2 != m_irecv_enter_ts.end()) ? it2->second : enter_ts;
     pushEvent(TT_MPI_Irecv, ENTER, enter_ts, irecv_enter_ts, pid,
               event.sender(), pid, event.msg_tag(), 0);
 #else
     auto ts = extractTimestamp(event.timestamp());
-
-    pushEvent(TT_MPI_Irecv, ENTER, ts, ts, pid,
-              event.sender(), pid, event.msg_tag(), 0);
+    pushEvent(TT_MPI_Irecv, ENTER, ts, ts, pid, event.sender(), pid,
+              event.msg_tag(), 0);
 #endif
-
     m_recv_count++;
   }
 
-  // --- Collective event callbacks ---
+  // --- Collective: begin ---
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_collective_begin &event) override {
     id_t pid = loc.ref().get();
+    if (pid < m_start || pid >= m_end)
+      return;
     auto ts = extractTimestamp(event.timestamp());
     m_coll_begin_ts[pid] = ts;
     m_coll_begin_valid[pid] = true;
   }
 
+  // --- Collective: end (with root-based routing) ---
   void event(const otf2::definition::location &loc,
              const otf2::event::mpi_collective_end &event) override {
     id_t pid = loc.ref().get();
+    if (pid < m_start || pid >= m_end)
+      return;
 
     if (!m_coll_begin_valid[pid])
       return;
@@ -197,7 +273,7 @@ public:
     auto end_ts = extractTimestamp(event.timestamp());
     timestamp_t begin_ts = m_coll_begin_ts[pid];
 
-    // Map OTF2 collective op type to our event_t
+    // Map OTF2 collective op type
     auto otf2_op_type = event.type();
     event_t op_type;
     int op_int = static_cast<int>(otf2_op_type);
@@ -229,14 +305,14 @@ public:
     else if (op_int == OTF2_COLLECTIVE_OP_ALLTOALL)
       op_type = TT_MPI_AlltoAll;
     else
-      return; // Unknown collective type, skip
+      return;
 
     // Extract communicator members
     auto comm_set = std::get<otf2::definition::comm_group>(
                         std::get<otf2::definition::comm>(event.comm()).group())
                         .members();
 
-    // Handle sentinel root value (same as TileTrace)
+    // Handle sentinel root value
     auto root = event.root();
     if (root == 4294967295u) {
       root = pid;
@@ -244,16 +320,26 @@ public:
         root = std::min(root, (uint32_t)id);
     }
 
-    size_t i = m_v_events.size();
-    pushEvent(op_type, ENTER, begin_ts, end_ts, pid,
-              0, 0, 0, root);
-
-    // Store comm_set
-    std::vector<uint64_t> cs(comm_set.begin(), comm_set.end());
-    m_comm_sets_out.push_back(std::move(cs));
-    m_coll_soa_indices.push_back(i);
-
-    m_coll_count++;
+    // Route by root location
+    if (root >= m_start && root < m_end) {
+      // Root is local: store directly
+      pushEvent(op_type, ENTER, begin_ts, end_ts, pid, 0, 0, 0, root);
+      std::vector<uint64_t> cs(comm_set.begin(), comm_set.end());
+      m_comm_sets.push_back(std::move(cs));
+      m_coll_count++;
+    } else {
+      // Root is remote: buffer for redistribution
+      id_t target = owningRank(m_nlocs, m_nprocs, root);
+      m_redist.op_types[target].push_back((int)op_type);
+      m_redist.begin_ts[target].push_back(begin_ts);
+      m_redist.end_ts[target].push_back(end_ts);
+      m_redist.roots[target].push_back(root);
+      m_redist.pids[target].push_back(pid);
+      // Flatten comm_set
+      m_redist.flat_comm_sets[target].push_back(comm_set.size());
+      for (auto id : comm_set)
+        m_redist.flat_comm_sets[target].push_back(id);
+    }
   }
 
   void events_done(const otf2::reader::reader &) override {}
@@ -264,10 +350,6 @@ public:
   size_t getRecvCount() const { return m_recv_count; }
   size_t getCollCount() const { return m_coll_count; }
 
-  const std::vector<size_t> &getCollSoAIndices() const {
-    return m_coll_soa_indices;
-  }
-
   // Copy vector data into pre-allocated TraceDataSoA
   void fillSoA(TraceDataSoA &data) const {
     size_t n = m_v_events.size();
@@ -275,40 +357,46 @@ public:
     data.count = n;
     std::memcpy(data.events, m_v_events.data(), n * sizeof(event_t));
     std::memcpy(data.types, m_v_types.data(), n * sizeof(event_type_t));
-    std::memcpy(data.timestamps, m_v_timestamps.data(), n * sizeof(timestamp_t));
-    std::memcpy(data.end_timestamps, m_v_end_timestamps.data(), n * sizeof(timestamp_t));
+    std::memcpy(data.timestamps, m_v_timestamps.data(),
+                n * sizeof(timestamp_t));
+    std::memcpy(data.end_timestamps, m_v_end_timestamps.data(),
+                n * sizeof(timestamp_t));
     std::memcpy(data.pids, m_v_pids.data(), n * sizeof(id_t));
     std::memcpy(data.srcs, m_v_srcs.data(), n * sizeof(id_t));
     std::memcpy(data.dsts, m_v_dsts.data(), n * sizeof(id_t));
     std::memcpy(data.tags, m_v_tags.data(), n * sizeof(id_t));
     std::memcpy(data.roots, m_v_roots.data(), n * sizeof(id_t));
-    // tids and replay_pids: set to pids
     std::memcpy(data.replay_pids, m_v_pids.data(), n * sizeof(id_t));
     std::memset(data.tids, 0, n * sizeof(id_t));
-    // indices: fill with 0..n-1
     for (size_t i = 0; i < n; i++)
       data.indices[i] = (id_t)i;
   }
 
-  std::vector<std::vector<uint64_t>> &getCommSets() { return m_comm_sets_out; }
+  std::vector<std::vector<uint64_t>> &getCommSets() { return m_comm_sets; }
 
-  // Access raw vectors for MPI gathering
-  const std::vector<event_t>       &rawEvents()     const { return m_v_events; }
-  const std::vector<event_type_t>  &rawTypes()      const { return m_v_types; }
-  const std::vector<timestamp_t>   &rawTimestamps() const { return m_v_timestamps; }
-  const std::vector<timestamp_t>   &rawEndTimestamps() const { return m_v_end_timestamps; }
-  const std::vector<id_t>          &rawPids()       const { return m_v_pids; }
-  const std::vector<id_t>          &rawSrcs()       const { return m_v_srcs; }
-  const std::vector<id_t>          &rawDsts()       const { return m_v_dsts; }
-  const std::vector<id_t>          &rawTags()       const { return m_v_tags; }
-  const std::vector<id_t>          &rawRoots()      const { return m_v_roots; }
+  // Append received collective events after redistribution
+  void appendCollectiveEvents(const std::vector<int> &recv_op_types,
+                              const std::vector<uint64_t> &recv_begin_ts,
+                              const std::vector<uint64_t> &recv_end_ts,
+                              const std::vector<uint32_t> &recv_roots,
+                              const std::vector<uint32_t> &recv_pids,
+                              const std::vector<std::vector<uint64_t>> &recv_cs) {
+    for (size_t i = 0; i < recv_pids.size(); i++) {
+      pushEvent((event_t)recv_op_types[i], ENTER, recv_begin_ts[i],
+                recv_end_ts[i], recv_pids[i], 0, 0, 0, recv_roots[i]);
+      m_comm_sets.push_back(recv_cs[i]);
+      m_coll_count++;
+    }
+  }
 
 private:
   otf2::reader::reader &m_rdr;
-  int m_rank;
-  int m_size;
+  const std::unordered_set<id_t> &m_related;
+  id_t m_start, m_end, m_nlocs;
+  int m_rank, m_nprocs;
+  CollRedistBuffers &m_redist;
 
-  // Dynamic vectors for single-pass reading
+  // Dynamic vectors for SoA data
   std::vector<event_t> m_v_events;
   std::vector<event_type_t> m_v_types;
   std::vector<timestamp_t> m_v_timestamps;
@@ -320,36 +408,26 @@ private:
   std::vector<id_t> m_v_roots;
 
   // Comm sets for collective events
-  std::vector<std::vector<uint64_t>> m_comm_sets_out;
-  std::vector<size_t> m_coll_soa_indices;
+  std::vector<std::vector<uint64_t>> m_comm_sets;
 
   // Collective begin/end pairing
   std::unordered_map<id_t, timestamp_t> m_coll_begin_ts;
   std::unordered_map<id_t, bool> m_coll_begin_valid;
 
 #ifdef USE_SCALASCA_TIMESTAMPS
-  // Last Enter region timestamp per location (for blocking recv and MPI_Wait)
   std::unordered_map<id_t, timestamp_t> m_last_enter_ts;
-  // Enter(MPI_Irecv) timestamp per location — saved when mpi_ireceive_request
-  // fires, used later by mpi_ireceive_complete for late_receiver analysis.
-  // Scalasca's late_receiver compares Enter(MPI_Irecv) with Enter(MPI_Send).
   std::unordered_map<id_t, timestamp_t> m_irecv_enter_ts;
-  // Last Leave timestamp per location (for capturing Leave(MPI_Send))
   std::unordered_map<id_t, timestamp_t> m_last_leave_ts;
-  // SoA index of last send event per location, so the Leave callback can
-  // update end_timestamps with the actual Leave(MPI_Send) timestamp.
-  // Value -1 means no pending send.
   std::unordered_map<id_t, int64_t> m_last_send_soa_idx;
 #endif
 
-  // Counts for diagnostics
   size_t m_send_count = 0;
   size_t m_recv_count = 0;
   size_t m_coll_count = 0;
 
   void pushEvent(event_t ev, event_type_t type, timestamp_t ts,
-                 timestamp_t end_ts, id_t pid, id_t src, id_t dst,
-                 id_t tag, id_t root) {
+                 timestamp_t end_ts, id_t pid, id_t src, id_t dst, id_t tag,
+                 id_t root) {
     m_v_events.push_back(ev);
     m_v_types.push_back(type);
     m_v_timestamps.push_back(ts);
@@ -360,147 +438,113 @@ private:
     m_v_tags.push_back(tag);
     m_v_roots.push_back(root);
   }
-
-  static timestamp_t
-  extractTimestamp(const otf2::chrono::time_point &tp) {
-    auto ts_ps =
-        std::chrono::time_point_cast<otf2::chrono::picoseconds>(tp);
-    return ts_ps.time_since_epoch().count();
-  }
 };
 
-// Gather all events from all MPI ranks to rank 0
-static void gatherEventsToRank0(
-    const SoAReaderCallback &cb, int rank, int comm_sz,
-    ReaderOutput &output,
-    size_t &total_sends, size_t &total_recvs, size_t &total_colls) {
+// ============================================================
+// Collective redistribution via MPI
+// ============================================================
+static void redistributeCollectives(Pass2DataCallback &cb,
+                                    CollRedistBuffers &redist, int rank,
+                                    int nprocs) {
+  for (int target = 0; target < nprocs; target++) {
+    int local_count = (int)redist.pids[target].size();
 
-  int local_count = (int)cb.getEventCount();
+    // Gather event counts to target rank
+    std::vector<int> recv_counts(nprocs);
+    MPI_Gather(&local_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT,
+               target, MPI_COMM_WORLD);
 
-  // Gather counts to all ranks (needed for displacements)
-  std::vector<int> all_counts(comm_sz);
-  MPI_Allgather(&local_count, 1, MPI_INT, all_counts.data(), 1, MPI_INT,
+    // Compute displacements on target rank
+    std::vector<int> displs(nprocs);
+    int total = 0;
+    if (rank == target) {
+      for (int i = 0; i < nprocs; i++) {
+        displs[i] = total;
+        total += recv_counts[i];
+      }
+    }
+
+    // Skip if no data to transfer for this target
+    int global_total = 0;
+    MPI_Allreduce(&local_count, &global_total, 1, MPI_INT, MPI_SUM,
+                  MPI_COMM_WORLD);
+    if (global_total == 0)
+      continue;
+
+    // Allocate receive buffers on target rank
+    std::vector<int> g_op_types;
+    std::vector<uint64_t> g_begin_ts, g_end_ts;
+    std::vector<uint32_t> g_roots, g_pids;
+    if (rank == target) {
+      g_op_types.resize(total);
+      g_begin_ts.resize(total);
+      g_end_ts.resize(total);
+      g_roots.resize(total);
+      g_pids.resize(total);
+    }
+
+    // Gatherv fixed-length arrays
+    MPI_Gatherv(redist.op_types[target].data(), local_count, MPI_INT,
+                rank == target ? g_op_types.data() : nullptr,
+                recv_counts.data(), displs.data(), MPI_INT, target,
+                MPI_COMM_WORLD);
+    MPI_Gatherv(redist.begin_ts[target].data(), local_count, MPI_UINT64_T,
+                rank == target ? (uint64_t *)g_begin_ts.data() : nullptr,
+                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
+                MPI_COMM_WORLD);
+    MPI_Gatherv(redist.end_ts[target].data(), local_count, MPI_UINT64_T,
+                rank == target ? (uint64_t *)g_end_ts.data() : nullptr,
+                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
+                MPI_COMM_WORLD);
+    MPI_Gatherv(redist.roots[target].data(), local_count, MPI_UINT32_T,
+                rank == target ? g_roots.data() : nullptr, recv_counts.data(),
+                displs.data(), MPI_UINT32_T, target, MPI_COMM_WORLD);
+    MPI_Gatherv(redist.pids[target].data(), local_count, MPI_UINT32_T,
+                rank == target ? g_pids.data() : nullptr, recv_counts.data(),
+                displs.data(), MPI_UINT32_T, target, MPI_COMM_WORLD);
+
+    // Gatherv variable-length comm_sets
+    int local_cs_len = (int)redist.flat_comm_sets[target].size();
+    std::vector<int> cs_lens(nprocs), cs_displs(nprocs);
+    MPI_Gather(&local_cs_len, 1, MPI_INT, cs_lens.data(), 1, MPI_INT, target,
+               MPI_COMM_WORLD);
+
+    int total_cs = 0;
+    if (rank == target) {
+      for (int i = 0; i < nprocs; i++) {
+        cs_displs[i] = total_cs;
+        total_cs += cs_lens[i];
+      }
+    }
+
+    std::vector<uint64_t> g_flat_cs;
+    if (rank == target)
+      g_flat_cs.resize(total_cs);
+
+    MPI_Gatherv(redist.flat_comm_sets[target].data(), local_cs_len,
+                MPI_UINT64_T, rank == target ? g_flat_cs.data() : nullptr,
+                cs_lens.data(), cs_displs.data(), MPI_UINT64_T, target,
                 MPI_COMM_WORLD);
 
-  int total = 0;
-  std::vector<int> displs(comm_sz);
-  for (int i = 0; i < comm_sz; i++) {
-    displs[i] = total;
-    total += all_counts[i];
-  }
-
-  // Gather send/recv/coll counts for diagnostics
-  size_t local_sends = cb.getSendCount(),
-         local_recvs = cb.getRecvCount(),
-         local_colls = cb.getCollCount();
-  MPI_Reduce(&local_sends, &total_sends, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
-             MPI_COMM_WORLD);
-  MPI_Reduce(&local_recvs, &total_recvs, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
-             MPI_COMM_WORLD);
-  MPI_Reduce(&local_colls, &total_colls, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
-             MPI_COMM_WORLD);
-
-  if (rank == 0) {
-    output.data.allocate(total);
-    output.data.count = total;
-  }
-
-  // Helper: Gatherv for typed arrays
-  auto gatherv_int = [&](const int *sendbuf, int *recvbuf) {
-    MPI_Gatherv(sendbuf, local_count, MPI_INT,
-                recvbuf, all_counts.data(), displs.data(), MPI_INT,
-                0, MPI_COMM_WORLD);
-  };
-  auto gatherv_u32 = [&](const uint32_t *sendbuf, uint32_t *recvbuf) {
-    MPI_Gatherv(sendbuf, local_count, MPI_UINT32_T,
-                recvbuf, all_counts.data(), displs.data(), MPI_UINT32_T,
-                0, MPI_COMM_WORLD);
-  };
-  auto gatherv_u64 = [&](const uint64_t *sendbuf, uint64_t *recvbuf) {
-    MPI_Gatherv(sendbuf, local_count, MPI_UINT64_T,
-                recvbuf, all_counts.data(), displs.data(), MPI_UINT64_T,
-                0, MPI_COMM_WORLD);
-  };
-
-  // Gather each SoA array
-  gatherv_int((const int *)cb.rawEvents().data(),
-              rank == 0 ? (int *)output.data.events : nullptr);
-  gatherv_int((const int *)cb.rawTypes().data(),
-              rank == 0 ? (int *)output.data.types : nullptr);
-  gatherv_u64(cb.rawTimestamps().data(),
-              rank == 0 ? output.data.timestamps : nullptr);
-  gatherv_u64(cb.rawEndTimestamps().data(),
-              rank == 0 ? output.data.end_timestamps : nullptr);
-  gatherv_u32(cb.rawPids().data(),
-              rank == 0 ? output.data.pids : nullptr);
-  gatherv_u32(cb.rawSrcs().data(),
-              rank == 0 ? output.data.srcs : nullptr);
-  gatherv_u32(cb.rawDsts().data(),
-              rank == 0 ? output.data.dsts : nullptr);
-  gatherv_u32(cb.rawTags().data(),
-              rank == 0 ? output.data.tags : nullptr);
-  gatherv_u32(cb.rawRoots().data(),
-              rank == 0 ? output.data.roots : nullptr);
-
-  if (rank == 0) {
-    // Fill tids, replay_pids, indices, match_partner, coll_group_id
-    std::memcpy(output.data.replay_pids, output.data.pids, total * sizeof(id_t));
-    std::memset(output.data.tids, 0, total * sizeof(id_t));
-    for (int i = 0; i < total; i++)
-      output.data.indices[i] = (id_t)i;
-  }
-
-  // --- Gather comm_sets ---
-  // Each rank sends: num_comm_sets, then for each: size, members...
-  // Flatten local comm_sets
-  auto &local_cs = const_cast<SoAReaderCallback &>(cb).getCommSets();
-  int local_num_cs = (int)local_cs.size();
-
-  // Flatten: [size0, m0_0, m0_1, ..., size1, m1_0, ...]
-  std::vector<uint64_t> flat_cs;
-  for (auto &cs : local_cs) {
-    flat_cs.push_back(cs.size());
-    flat_cs.insert(flat_cs.end(), cs.begin(), cs.end());
-  }
-  int flat_cs_len = (int)flat_cs.size();
-
-  // Gather flat_cs lengths
-  std::vector<int> cs_lens(comm_sz);
-  MPI_Gather(&flat_cs_len, 1, MPI_INT, cs_lens.data(), 1, MPI_INT, 0,
-             MPI_COMM_WORLD);
-
-  std::vector<int> cs_displs(comm_sz);
-  int total_flat_cs = 0;
-  if (rank == 0) {
-    for (int i = 0; i < comm_sz; i++) {
-      cs_displs[i] = total_flat_cs;
-      total_flat_cs += cs_lens[i];
-    }
-  }
-
-  std::vector<uint64_t> all_flat_cs;
-  if (rank == 0)
-    all_flat_cs.resize(total_flat_cs);
-
-  MPI_Gatherv(flat_cs.data(), flat_cs_len, MPI_UINT64_T,
-              rank == 0 ? all_flat_cs.data() : nullptr,
-              cs_lens.data(), cs_displs.data(), MPI_UINT64_T,
-              0, MPI_COMM_WORLD);
-
-  // Reconstruct comm_sets on rank 0
-  if (rank == 0) {
-    output.comm_sets.clear();
-    size_t pos = 0;
-    while (pos < all_flat_cs.size()) {
-      size_t sz = all_flat_cs[pos++];
-      std::vector<uint64_t> cs(all_flat_cs.begin() + pos,
-                               all_flat_cs.begin() + pos + sz);
-      output.comm_sets.push_back(std::move(cs));
-      pos += sz;
+    // On target rank: reconstruct and append
+    if (rank == target && total > 0) {
+      std::vector<std::vector<uint64_t>> recv_cs;
+      size_t pos = 0;
+      while (pos < g_flat_cs.size()) {
+        size_t sz = g_flat_cs[pos++];
+        recv_cs.emplace_back(g_flat_cs.begin() + pos,
+                             g_flat_cs.begin() + pos + sz);
+        pos += sz;
+      }
+      cb.appendCollectiveEvents(g_op_types, g_begin_ts, g_end_ts, g_roots,
+                                g_pids, recv_cs);
     }
   }
 }
 
+// ============================================================
+// Main entry point: two-pass distributed reading
+// ============================================================
 ReaderOutput readOTF2Trace(const std::string &trace_path) {
   ReaderOutput output;
 
@@ -510,49 +554,102 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
 
   auto t_start = std::chrono::high_resolution_clock::now();
 
-  size_t total_sends = 0, total_recvs = 0, total_colls = 0;
+  std::unordered_set<id_t> related_locs;
+  id_t start_loc = 0, end_loc = 0, nlocs = 0;
 
+  // ======== PASS 1: DISCOVERY ========
   {
-    // Open reader with MPI for parallel location reading
     otf2::reader::reader rdr(trace_path, MPI_COMM_WORLD);
-    SoAReaderCallback cb(rdr, rank, comm_sz);
+    nlocs = rdr.num_locations();
+
+    auto [s, e] = traceRange(nlocs, comm_sz, rank);
+    start_loc = s;
+    end_loc = e;
+
+    if (rank == 0) {
+      std::cout << "[Reader] " << nlocs << " locations, " << comm_sz
+                << " ranks, pass 1 discovery..." << std::endl;
+    }
+
+    Pass1DiscoveryCallback cb(rdr, start_loc, end_loc, related_locs);
     rdr.set_callback(cb);
     rdr.read_definitions();
     rdr.read_events();
-
-    auto t_read = std::chrono::high_resolution_clock::now();
-    double read_ms = std::chrono::duration<double, std::milli>(t_read - t_start).count();
-
-    if (rank == 0) {
-      std::cout << "[Reader] Local read done in " << read_ms << " ms" << std::endl;
-    }
-
-    if (comm_sz == 1) {
-      // Single process: no MPI gathering needed
-      total_sends = cb.getSendCount();
-      total_recvs = cb.getRecvCount();
-      total_colls = cb.getCollCount();
-      cb.fillSoA(output.data);
-      output.comm_sets = std::move(cb.getCommSets());
-    } else {
-      // Multi-process: gather all events to rank 0
-      gatherEventsToRank0(cb, rank, comm_sz, output,
-                          total_sends, total_recvs, total_colls);
-    }
   }
 
-  auto t_end = std::chrono::high_resolution_clock::now();
-  double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+  auto t_pass1 = std::chrono::high_resolution_clock::now();
+  double pass1_ms =
+      std::chrono::duration<double, std::milli>(t_pass1 - t_start).count();
 
   if (rank == 0) {
-    size_t total_events = (comm_sz == 1) ? output.data.count :
-                          total_sends + total_recvs + total_colls;
-    std::cout << "[Reader] Read " << total_events << " events"
-              << " (" << comm_sz << " MPI ranks) in " << total_ms << " ms"
+    std::cout << "[Reader] Pass 1 done in " << pass1_ms << " ms" << std::endl;
+  }
+
+  // ======== PASS 2: DATA LOADING ========
+  CollRedistBuffers redist(comm_sz);
+  Pass2DataCallback *data_cb = nullptr;
+  {
+    otf2::reader::reader rdr2(trace_path, MPI_COMM_WORLD);
+
+    data_cb =
+        new Pass2DataCallback(rdr2, related_locs, start_loc, end_loc, nlocs,
+                              rank, comm_sz, redist);
+    rdr2.set_callback(*data_cb);
+    rdr2.read_definitions();
+    rdr2.read_events();
+  }
+
+  auto t_pass2 = std::chrono::high_resolution_clock::now();
+  double pass2_ms =
+      std::chrono::duration<double, std::milli>(t_pass2 - t_pass1).count();
+
+  if (rank == 0) {
+    std::cout << "[Reader] Pass 2 done in " << pass2_ms << " ms" << std::endl;
+  }
+
+  // ======== COLLECTIVE REDISTRIBUTION ========
+  if (comm_sz > 1) {
+    redistributeCollectives(*data_cb, redist, rank, comm_sz);
+  }
+
+  auto t_redist = std::chrono::high_resolution_clock::now();
+  double redist_ms =
+      std::chrono::duration<double, std::milli>(t_redist - t_pass2).count();
+
+  // ======== BUILD SOA ========
+  data_cb->fillSoA(output.data);
+  output.comm_sets = std::move(data_cb->getCommSets());
+
+  // Gather total counts for diagnostics
+  size_t local_sends = data_cb->getSendCount(),
+         local_recvs = data_cb->getRecvCount(),
+         local_colls = data_cb->getCollCount();
+  size_t total_sends = 0, total_recvs = 0, total_colls = 0;
+  MPI_Reduce(&local_sends, &total_sends, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_recvs, &total_recvs, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_colls, &total_colls, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+
+  delete data_cb;
+
+  auto t_end = std::chrono::high_resolution_clock::now();
+  double total_ms =
+      std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+  if (rank == 0) {
+    std::cout << "[Reader] Collective redistribution: " << redist_ms << " ms"
               << std::endl;
-    std::cout << "[Reader] Breakdown: " << total_sends << " sends, "
-              << total_recvs << " recvs, "
-              << total_colls << " collectives" << std::endl;
+    std::cout << "[Reader] Total events (global): "
+              << total_sends + total_recvs + total_colls
+              << " (" << total_sends << " sends, " << total_recvs << " recvs, "
+              << total_colls << " collectives)" << std::endl;
+    std::cout << "[Reader] Local events on rank 0: " << output.data.count
+              << std::endl;
+    std::cout << "[Reader] Total read time: " << total_ms << " ms (pass1="
+              << pass1_ms << ", pass2=" << pass2_ms << ", redist=" << redist_ms
+              << ")" << std::endl;
   }
 
   return output;

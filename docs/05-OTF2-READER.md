@@ -1,11 +1,11 @@
-# OTF2 Reader — MPI-Parallel Trace Reading
+# OTF2 Reader — Distributed Two-Pass Trace Reading
 
 **Source**: `src/reader/OTF2SoAReader.cpp`
 **Header**: `include/reader/OTF2SoAReader.h`
 
 ## Overview
 
-The OTF2 reader is the most complex module (~480 lines). It reads OTF2 trace files produced by Score-P and converts them into the SoA format used by the rest of the pipeline. It supports MPI-parallel reading for performance.
+The OTF2 reader uses a **distributed two-pass** strategy inspired by TileTrace. Each MPI rank reads a contiguous block of locations plus their communication partners, performs local P2P matching and collective grouping, and runs GPU analysis independently. Only final result vectors are gathered to rank 0.
 
 ## otf2xx Callback System
 
@@ -17,41 +17,72 @@ The reader uses the **otf2xx** library (C++ wrapper around the OTF2 C API). otf2
 4. Call `reader.read_events()` — triggers `event()` callbacks
 5. The library calls the appropriate overloaded `event()` method for each event type
 
-```cpp
-class SoAReaderCallback : public otf2::reader::callback {
-    // Definition callbacks
-    void definition(const otf2::definition::location &loc) override;
-    void definitions_done(const otf2::reader::reader &) override;
+Two separate callback classes are used for the two passes:
 
-    // Event callbacks
+```cpp
+// Pass 1: Discovery — lightweight, only finds communication partners
+class Pass1DiscoveryCallback : public otf2::reader::callback {
+    void definition(const otf2::definition::location &loc) override;
+    void event(const otf2::definition::location &, const otf2::event::mpi_send &) override;
+    void event(const otf2::definition::location &, const otf2::event::mpi_isend_request &) override;
+};
+
+// Pass 2: Data loading — full event processing with collective routing
+class Pass2DataCallback : public otf2::reader::callback {
+    void definition(const otf2::definition::location &loc) override;
     void event(const otf2::definition::location &, const otf2::event::enter &) override;
-    void event(const otf2::definition::location &, const otf2::event::leave &) override;  // Scalasca mode
+    void event(const otf2::definition::location &, const otf2::event::leave &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_send &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_receive &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_isend_request &) override;
-    void event(const otf2::definition::location &, const otf2::event::mpi_ireceive_request &) override;  // Scalasca mode
+    void event(const otf2::definition::location &, const otf2::event::mpi_ireceive_request &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_ireceive_complete &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_collective_begin &) override;
     void event(const otf2::definition::location &, const otf2::event::mpi_collective_end &) override;
 };
 ```
 
-## MPI-Parallel Reading
+## Distributed Two-Pass Reading
 
-### Location Distribution
+### Location Assignment
 
-OTF2 traces contain one "location" per MPI process in the traced application. Locations are distributed across reader MPI ranks using round-robin:
+Locations are assigned as contiguous blocks using `traceRange(nlocs, nprocs, rank)`:
 
-```cpp
-void definition(const otf2::definition::location &loc) override {
-    uint64_t loc_id = loc.ref().get();
-    if ((int)(loc_id % m_size) == m_rank) {
-        m_rdr.register_location(loc);  // Only register locations for this rank
-    }
-}
+```
+For 16 locations with 3 ranks:
+  Rank 0: [0, 6)   — 6 locations (remainder distributed to early ranks)
+  Rank 1: [6, 11)  — 5 locations
+  Rank 2: [11, 16) — 5 locations
 ```
 
-For a 64-location trace with 8 reading ranks: rank 0 reads locations {0,8,16,...56}, rank 1 reads {1,9,17,...57}, etc.
+The inverse function `owningRank(nlocs, nprocs, loc_id)` maps a location to its owning rank, used for routing collective events.
+
+### Pass 1: Discovery
+
+Each rank opens the OTF2 trace, registers only its own locations, and reads events. Only `mpi_send` and `mpi_isend_request` callbacks are active — they record receiver locations in a `std::unordered_set<id_t> related_locs`. After pass 1, `related_locs` contains all locations this rank needs for pass 2 (own + receivers of local sends).
+
+### Pass 2: Data Loading
+
+Each rank opens a second reader, registers all locations in `related_locs`, and reads events with full processing. Filtering rules:
+
+- **Sends** (`mpi_send`, `mpi_isend_request`): Only store events from own locations `[start, end)`
+- **Recvs** (`mpi_receive`, `mpi_ireceive_complete`): Only store events where `sender in [start, end)`
+- **Collective begin**: Only track for own locations
+- **Collective end**: If root is local → store directly; if root is remote → buffer for redistribution
+
+This ensures all send-recv pairs where the sender is local are co-located on the same rank.
+
+### Collective Redistribution
+
+After pass 2, each rank has buffered collective events whose root belongs to other ranks. These are redistributed using MPI:
+
+```
+For each target rank t in [0, nprocs):
+  1. MPI_Gather: each rank sends count of events destined for t
+  2. MPI_Gatherv × 5: send op_type, begin_ts, end_ts, root, pid arrays
+  3. MPI_Gatherv × 1: send flattened comm_sets [size, member0, member1, ...]
+  4. Target rank reconstructs and appends events via appendCollectiveEvents()
+```
 
 ### MPI Reader Constructor
 
@@ -63,43 +94,11 @@ otf2::reader::reader rdr(trace_path, MPI_COMM_WORLD);
 
 This requires `OTF2XX_WITH_MPI ON` set before `add_subdirectory(third_party/otf2xx)`. Without it, the `OTF2XX_HAS_MPI` define is absent and the MPI constructor is not available, causing a compile error.
 
-### Gathering to Rank 0
-
-After reading, all data is gathered to rank 0 via `MPI_Gatherv`:
-
-```
-Step 1: MPI_Allgather event counts (each rank reports how many events it read)
-Step 2: Compute displacements (prefix sum of counts)
-Step 3: MPI_Gatherv for each SoA array (events[], timestamps[], pids[], etc.)
-Step 4: MPI_Gatherv for comm_sets (flattened format)
-```
-
-The comm_sets gathering uses a flattened format because `MPI_Gatherv` requires contiguous buffers:
-
-```
-Flat format: [size0, member0_0, member0_1, ..., size1, member1_0, ...]
-```
-
-Each comm_set is prefixed with its size, then serialized members follow. Rank 0 reconstructs the nested vectors after gathering.
-
-### Single-Process Path
-
-When `comm_sz == 1`, the `MPI_Gatherv` calls are bypassed entirely:
-
-```cpp
-if (comm_sz == 1) {
-    cb.fillSoA(output.data);
-    output.comm_sets = std::move(cb.getCommSets());
-} else {
-    gatherEventsToRank0(cb, rank, comm_sz, output, ...);
-}
-```
-
 ## Event Processing Details
 
-### Single-Pass Reading
+### Vector-Based Event Accumulation
 
-The reader uses a **single-pass** approach with `std::vector` dynamic arrays:
+The reader uses `std::vector` dynamic arrays in Pass 2:
 
 ```cpp
 std::vector<event_t> m_v_events;
@@ -124,8 +123,6 @@ void fillSoA(TraceDataSoA &data) const {
     // ...
 }
 ```
-
-**History**: The original implementation used a two-pass approach (pass 1: count events, pass 2: fill arrays). This doubled I/O time unnecessarily. The single-pass approach with vectors halves the I/O time at the cost of dynamic memory allocation (which is negligible compared to I/O).
 
 ### Enter Timestamp Tracking
 

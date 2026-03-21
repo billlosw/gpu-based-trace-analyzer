@@ -65,30 +65,34 @@ gpu-analyzer/
 
 ### `main.cu` - Pipeline Orchestrator
 
-**Location**: `src/main.cu` (226 lines)
+**Location**: `src/main.cu`
 
-Coordinates the 5-step pipeline:
-1. Calls `readOTF2Trace()` with all MPI ranks
-2. Non-rank-0 processes `MPI_Finalize()` and exit
-3. On rank 0: calls `runP2PMatching()`, `buildCollectiveGroups()`, `runAnalysisKernels()`, `computeStatistics()`
-4. Prints formatted results and timing summary
+Coordinates the 6-step distributed pipeline:
+1. All ranks call `readOTF2Trace()` — distributed two-pass reading
+2. All ranks call `runP2PMatching()` on their local data
+3. All ranks call `buildCollectiveGroups()` on their local data
+4. All ranks call `runAnalysisKernels()` on their local data (GPU)
+5. `gatherRawResults()` gathers duration vectors from all ranks to rank 0
+6. Rank 0 computes statistics and prints results
 
-**Important**: `MPI_Init()` and `MPI_Finalize()` are called here. The program must be run with `srun` or `mpirun`.
+**Important**: `MPI_Init()` and `MPI_Finalize()` are called by all ranks. The program must be run with `srun` or `mpirun`.
 
-### `OTF2SoAReader.cpp` - Trace Reader
+### `OTF2SoAReader.cpp` - Trace Reader (Distributed Two-Pass)
 
-**Location**: `src/reader/OTF2SoAReader.cpp` (481 lines)
+**Location**: `src/reader/OTF2SoAReader.cpp`
 
-The largest and most complex module. Contains:
-- `SoAReaderCallback` class: otf2xx callback handler that processes OTF2 events
-- `gatherEventsToRank0()`: MPI gathering logic
-- `readOTF2Trace()`: Public entry point
+The largest and most complex module. Uses TileTrace-style two-pass distributed reading:
+- `Pass1DiscoveryCallback`: Lightweight first pass that discovers communication partners
+- `Pass2DataCallback`: Full data loading with root-based collective routing
+- `redistributeCollectives()`: MPI exchange of non-local collective events
+- `readOTF2Trace()`: Public entry point orchestrating both passes
 
 **Key responsibilities**:
-- Map OTF2 events to internal `event_t` enums
-- Use Enter region timestamps (Scalasca semantics) instead of point-event timestamps
-- Distribute locations across MPI ranks (round-robin)
-- Gather all data to rank 0 via `MPI_Gatherv`
+- Assign contiguous location blocks to MPI ranks (`traceRange`)
+- Pass 1: Discover related locations (receivers of local sends)
+- Pass 2: Load events for own + related locations (SoA format)
+- Route collective events by root location (local → store, remote → buffer for MPI exchange)
+- Redistribute buffered collective events via `MPI_Gatherv`
 
 ### `P2PMatching.cu` - Send-Recv Matching
 
@@ -165,13 +169,13 @@ target_link_libraries(${test_name} PRIVATE gpu_analyzer_lib)
 ```
 Time →
 
-Rank 0:  [======= OTF2 Read =======][=== P2P Match ===][= Coll Group =][=== GPU Kernels ===][= Stats =]
-Rank 1:  [======= OTF2 Read =======] exit
-Rank 2:  [======= OTF2 Read =======] exit
+Rank 0:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= GPU =][= Gather =][= Stats =]
+Rank 1:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= GPU =][= Gather =]
 ...
-Rank N:  [======= OTF2 Read =======] exit
+Rank N:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= GPU =][= Gather =]
 
-                                      ← Only rank 0 continues →
+← All ranks participate in reading, matching, analysis, and result gathering →
+← Only rank 0 computes final statistics and prints results →
 ```
 
-All MPI ranks participate in reading, then only rank 0 does analysis. GPU kernels run sequentially (no streams or overlapping), which is simpler but leaves room for optimization with large traces.
+All MPI ranks participate in the full pipeline up to result gathering. Each rank processes its local portion of the trace independently, then duration vectors are gathered to rank 0 for global statistics.
