@@ -27,29 +27,28 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
                           |  (.otf2 + traces/)    |
                           +-----------+-----------+
                                       |
-                    Step 1: MPI-Parallel Reading
-                    (N ranks, round-robin locations)
-                                      |
-                          +-----------v-----------+
-                          | MPI_Gatherv to rank 0 |
-                          | SoA data in host RAM  |
-                          +-----------+-----------+
+                    Step 1: MPI-Parallel Two-Pass Reading
+                    (N ranks, contiguous location blocks)
                                       |
             +-------------------------+-------------------------+
             |                                                   |
-   Step 2: P2P Matching (CPU)                    Step 3: Collective Grouping (CPU)
-   timestamp-sorted FIFO queues                  comm_set-based, produces CSR
+   Step 2: P2P Matching (CPU, local)           Step 3: Collective Grouping (CPU, local)
+   timestamp-sorted FIFO queues                comm_set-based, produces CSR
             |                                                   |
             +-------------------------+-------------------------+
                                       |
-                    Step 4: cudaMemcpy Host -> Device
+                    Step 4: MPI_Gatherv to rank 0
+                    (SoA + CSR with index remapping)
+                                      |
+                    Step 5: cudaMemcpy Host -> Device (rank 0)
                                       |
                           +-----------v-----------+
                           |  5 CUDA Kernels       |
                           |  (8 analyses total)   |
+                          |  SINGLE GPU, rank 0   |
                           +-----------+-----------+
                                       |
-                    Step 5: cudaMemcpy Device -> Host
+                    cudaMemcpy Device -> Host
                                       |
                           +-----------v-----------+
                           | CPU Statistics        |
@@ -67,9 +66,10 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Data layout | **SoA** (Structure of Arrays) | GPU coalesced memory access; warps read contiguous addresses |
-| Trace reading | **MPI-parallel**, otf2xx | Dominated by I/O; parallelizing across ranks gives near-linear speedup |
-| P2P matching | **CPU**, timestamp-sorted FIFO | Requires temporal ordering which is hard to do correctly on GPU with atomics |
-| Collective grouping | **CPU**, comm_set-based CSR | Variable-length groups; small fraction of total events; produces GPU-friendly CSR |
+| Trace reading | **MPI-parallel two-pass**, otf2xx | Dominated by I/O; parallelizing across ranks gives near-linear speedup |
+| P2P matching | **CPU**, timestamp-sorted FIFO per rank | Requires temporal ordering; done locally on each rank in parallel |
+| Collective grouping | **CPU**, comm_set-based CSR per rank | Variable-length groups; small fraction of total events; produces GPU-friendly CSR |
+| GPU analysis | **Single GPU on rank 0**, merged data | All MPI ranks gather matched data to rank 0; avoids GPU contention |
 | Analysis kernels | **GPU CUDA kernels** | Massively parallel event processing; one thread/event for P2P, one block/group for collectives |
 | Event linking | **Index-based** (int32_t) | GPU-compatible; no pointers across host/device |
 
@@ -77,11 +77,11 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
 
 | Aspect | TileTrace (CPU) | GPU Analyzer |
 |--------|-----------------|--------------|
-| Parallelism | MPI across nodes | MPI for I/O only, CUDA for analysis |
+| Parallelism | MPI across nodes | MPI for I/O + CPU matching, single CUDA GPU for analysis |
 | Data Layout | AoS (struct Event) | SoA (12 contiguous arrays) |
 | P2P Matching | CPU hash map during replay | CPU timestamp-sorted FIFO queues |
 | Collective Groups | Inline with matching | Separate CPU preprocessing -> CSR |
-| Reading | Serial or MPI (1-pass per rank) | MPI-parallel (round-robin locations) |
+| Reading | Serial or MPI (1-pass per rank) | MPI-parallel two-pass (contiguous location blocks) |
 | Hardware | 2x Xeon Gold 6530, 1TB RAM | 1x RTX 4090/5090 + any CPU |
 
 ## Validation Status

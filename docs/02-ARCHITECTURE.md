@@ -67,12 +67,12 @@ gpu-analyzer/
 
 **Location**: `src/main.cu`
 
-Coordinates the 6-step distributed pipeline:
+Coordinates the 6-step distributed pipeline with single-GPU analysis:
 1. All ranks call `readOTF2Trace()` — distributed two-pass reading
 2. All ranks call `runP2PMatching()` on their local data
 3. All ranks call `buildCollectiveGroups()` on their local data
-4. All ranks call `runAnalysisKernels()` on their local data (GPU)
-5. `gatherRawResults()` gathers duration vectors from all ranks to rank 0
+4. `gatherTraceData()` gathers SoA + CSR from all ranks to rank 0, remapping local indices to global
+5. Rank 0 calls `runAnalysisKernels()` once on the merged data (single GPU)
 6. Rank 0 computes statistics and prints results
 
 **Important**: `MPI_Init()` and `MPI_Finalize()` are called by all ranks. The program must be run with `srun` or `mpirun`.
@@ -169,13 +169,13 @@ target_link_libraries(${test_name} PRIVATE gpu_analyzer_lib)
 ```
 Time →
 
-Rank 0:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= GPU =][= Gather =][= Stats =]
-Rank 1:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= GPU =][= Gather =]
+Rank 0:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Gather Data =][=== GPU ===][= Stats =]
+Rank 1:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Gather Data =]
 ...
-Rank N:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= GPU =][= Gather =]
+Rank N:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Gather Data =]
 
-← All ranks participate in reading, matching, analysis, and result gathering →
-← Only rank 0 computes final statistics and prints results →
+← All ranks participate in reading, matching, and data gathering →
+← Only rank 0 runs GPU analysis, computes final statistics and prints results →
 ```
 
-All MPI ranks participate in the full pipeline up to result gathering. Each rank processes its local portion of the trace independently, then duration vectors are gathered to rank 0 for global statistics.
+All MPI ranks participate in distributed reading, P2P matching, collective grouping, and data gathering. After gathering, rank 0 holds the merged global SoA data (with remapped indices) and CSR, runs a single GPU analysis pass, then computes and prints statistics. This avoids GPU contention from multiple processes sharing one GPU.
