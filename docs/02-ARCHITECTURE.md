@@ -67,13 +67,16 @@ gpu-analyzer/
 
 **Location**: `src/main.cu`
 
-Coordinates the 6-step distributed pipeline with single-GPU analysis:
+Coordinates the 5-step distributed pipeline with adaptive batch streaming GPU analysis:
 1. All ranks call `readOTF2Trace()` — distributed two-pass reading
 2. All ranks call `runP2PMatching()` on their local data
 3. All ranks call `buildCollectiveGroups()` on their local data
-4. `gatherTraceData()` gathers SoA + CSR from all ranks to rank 0, remapping local indices to global
-5. Rank 0 calls `runAnalysisKernels()` once on the merged data (single GPU)
-6. Rank 0 computes statistics and prints results
+4. `streamBatchAnalysis()` — adaptive batch streaming (Architecture C):
+   - All ranks gather event counts; rank 0 computes batch size K from VRAM
+   - Non-zero ranks send data via MPI point-to-point
+   - Rank 0 receives K ranks/batch, merges with index remapping, runs GPU kernels
+   - Results accumulated across batches; memory bounded by O(K*N/P)
+5. Rank 0 computes statistics and prints results
 
 **Important**: `MPI_Init()` and `MPI_Finalize()` are called by all ranks. The program must be run with `srun` or `mpirun`.
 
@@ -169,13 +172,14 @@ target_link_libraries(${test_name} PRIVATE gpu_analyzer_lib)
 ```
 Time →
 
-Rank 0:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Gather Data =][=== GPU ===][= Stats =]
-Rank 1:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Gather Data =]
+Rank 0:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Batch Stream: recv+GPU per K ranks =][= Stats =]
+Rank 1:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Send data to R0 =]
 ...
-Rank N:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Gather Data =]
+Rank N:  [= Pass 1 =][== Pass 2 ==][= Redist =][= P2P =][= Coll =][= Send data to R0 =]
 
-← All ranks participate in reading, matching, and data gathering →
-← Only rank 0 runs GPU analysis, computes final statistics and prints results →
+← All ranks participate in reading, matching, and grouping →
+← Non-zero ranks send data via MPI point-to-point, then exit →
+← Rank 0 receives in batches of K, runs GPU analysis, accumulates results →
 ```
 
-All MPI ranks participate in distributed reading, P2P matching, collective grouping, and data gathering. After gathering, rank 0 holds the merged global SoA data (with remapped indices) and CSR, runs a single GPU analysis pass, then computes and prints statistics. This avoids GPU contention from multiple processes sharing one GPU.
+All MPI ranks participate in distributed reading, P2P matching, and collective grouping. For analysis, rank 0 adaptively batches K ranks' data per GPU launch (Architecture C: Adaptive Batch Streaming). K is computed from available VRAM: K=P for small traces (all fit), K=1 for extreme traces (pure streaming). Memory on rank 0 is bounded by O(K*N/P), not O(N), eliminating the scalability wall of the previous gather-all approach.

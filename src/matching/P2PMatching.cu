@@ -83,7 +83,7 @@ void runP2PMatching(TraceDataSoA &data) {
     }
   }
 
-  std::cout << "[P2P Matching] Matched " << match_count << " pairs" << std::endl;
+  // std::cout << "[P2P Matching] Matched " << match_count << " pairs" << std::endl;
 
   // Report unmatched
   size_t unmatched_send = 0, unmatched_recv = 0;

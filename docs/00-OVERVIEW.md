@@ -37,18 +37,14 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
             |                                                   |
             +-------------------------+-------------------------+
                                       |
-                    Step 4: MPI_Gatherv to rank 0
-                    (SoA + CSR with index remapping)
-                                      |
-                    Step 5: cudaMemcpy Host -> Device (rank 0)
-                                      |
-                          +-----------v-----------+
-                          |  5 CUDA Kernels       |
-                          |  (8 analyses total)   |
-                          |  SINGLE GPU, rank 0   |
-                          +-----------+-----------+
-                                      |
-                    cudaMemcpy Device -> Host
+                    Step 4: Adaptive Batch Streaming (Architecture C)
+                    Rank 0 computes K = min(P, VRAM_budget / per_rank_data)
+                    For each batch of K ranks:
+                      - MPI point-to-point recv K ranks' SoA + CSR
+                      - Merge with index remapping (if K > 1)
+                      - H2D → 5 CUDA Kernels → D2H on single GPU
+                      - Accumulate results
+                    Memory: O(K*N/P), not O(N)
                                       |
                           +-----------v-----------+
                           | CPU Statistics        |
@@ -69,7 +65,7 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
 | Trace reading | **MPI-parallel two-pass**, otf2xx | Dominated by I/O; parallelizing across ranks gives near-linear speedup |
 | P2P matching | **CPU**, timestamp-sorted FIFO per rank | Requires temporal ordering; done locally on each rank in parallel |
 | Collective grouping | **CPU**, comm_set-based CSR per rank | Variable-length groups; small fraction of total events; produces GPU-friendly CSR |
-| GPU analysis | **Single GPU on rank 0**, merged data | All MPI ranks gather matched data to rank 0; avoids GPU contention |
+| GPU analysis | **Adaptive batch streaming on rank 0** | K ranks' data per GPU batch; K computed from VRAM; O(K*N/P) memory |
 | Analysis kernels | **GPU CUDA kernels** | Massively parallel event processing; one thread/event for P2P, one block/group for collectives |
 | Event linking | **Index-based** (int32_t) | GPU-compatible; no pointers across host/device |
 
