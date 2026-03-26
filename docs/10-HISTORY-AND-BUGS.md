@@ -15,6 +15,7 @@ This document chronicles the key bugs encountered and fixed during development, 
 | 2026-03-15 (PM) | Achieved exact match with Scalasca on 7/8 analyses (late_receiver pending) |
 | 2026-03-16 | Added timestamp mode selector (SCALASCA / TILETRACE via CMake) |
 | 2026-03-17 | Fixed late_receiver: independent check + correct Scalasca timestamps → 8/8 exact match |
+| 2026-03-26 | Fixed Irecv enter timestamp per-request_id tracking; performance comparison on large traces |
 
 ## Bug 1: Silent CUDA Kernel Failure (CUDA Version Mismatch)
 
@@ -135,3 +136,13 @@ GPU Analyzer: mpi_send_event=1003  vs Enter(MPI_Recv)=1002 → late_sender (fals
 **Result**: All 8 analyses now match Scalasca exactly (count, sum, max) on both CG-B and CG-C.
 
 **Lesson**: Scalasca uses `pearl::timestamp_t = double` (signed), so subtractions can go negative and filter naturally. Our `uint64_t` timestamps require explicit `>` guards to prevent unsigned underflow.
+
+## Bug 11: Irecv Enter Timestamp Per-PID Overwrite
+
+**Symptom**: `late_receiver` counts differed from Scalasca on large traces with many concurrent non-blocking receives (NPB CG 1024: 8,985,237 vs 7,731,027).
+
+**Root Cause**: `m_irecv_enter_ts` was keyed by PID (location ID) instead of `request_id`. When multiple `MPI_Irecv` operations are outstanding on the same location (common in NPB CG where 96% of recvs are non-blocking), only the LAST one's `Enter(MPI_Irecv)` timestamp was stored. Earlier Irecvs received incorrect (overwritten) timestamps.
+
+**Fix**: Changed `m_irecv_enter_ts` from `unordered_map<id_t, timestamp_t>` (per-PID) to `unordered_map<uint64_t, timestamp_t>` (per-request_id). Look up by `event.request_id()` in both `mpi_ireceive_request` and `mpi_ireceive_complete`, with erase-after-use.
+
+**Result**: Counts changed (CG 1024: 8,985,237 → 11,115,347). The increase is expected: correct earlier timestamps change which events satisfy the late_receiver condition. The remaining discrepancy with Scalasca is a separate algorithmic issue (see PROBLEMS.md TODO 19).

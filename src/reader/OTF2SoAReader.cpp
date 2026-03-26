@@ -165,6 +165,7 @@ public:
               event.msg_tag(), 0);
 #endif
     m_send_count++;
+    m_blocking_send_count++;
   }
 
   // --- P2P: store recvs only where sender is in own range ---
@@ -187,6 +188,7 @@ public:
               event.msg_tag(), 0);
 #endif
     m_recv_count++;
+    m_blocking_recv_count++;
   }
 
   void event(const otf2::definition::location &loc,
@@ -211,6 +213,7 @@ public:
               event.msg_tag(), 0);
 #endif
     m_send_count++;
+    m_nonblocking_send_count++;
   }
 
 #ifdef USE_SCALASCA_TIMESTAMPS
@@ -219,7 +222,9 @@ public:
     id_t pid = loc.ref().get();
     auto it = m_last_enter_ts.find(pid);
     if (it != m_last_enter_ts.end()) {
-      m_irecv_enter_ts[pid] = it->second;
+      // Key by request_id (not PID) to correctly handle multiple
+      // outstanding Irecvs per location.
+      m_irecv_enter_ts[event.request_id()] = it->second;
     }
   }
 #endif
@@ -235,9 +240,13 @@ public:
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
-    auto it2 = m_irecv_enter_ts.find(pid);
+    // Look up by request_id to get the correct Enter(MPI_Irecv)
+    // timestamp even when multiple Irecvs are outstanding.
+    auto it2 = m_irecv_enter_ts.find(event.request_id());
     timestamp_t irecv_enter_ts =
         (it2 != m_irecv_enter_ts.end()) ? it2->second : enter_ts;
+    if (it2 != m_irecv_enter_ts.end())
+      m_irecv_enter_ts.erase(it2);
     pushEvent(TT_MPI_Irecv, ENTER, enter_ts, irecv_enter_ts, pid,
               event.sender(), pid, event.msg_tag(), 0);
 #else
@@ -246,6 +255,7 @@ public:
               event.msg_tag(), 0);
 #endif
     m_recv_count++;
+    m_nonblocking_recv_count++;
   }
 
   // --- Collective: begin ---
@@ -349,6 +359,10 @@ public:
   size_t getSendCount() const { return m_send_count; }
   size_t getRecvCount() const { return m_recv_count; }
   size_t getCollCount() const { return m_coll_count; }
+  size_t getBlockingSendCount() const { return m_blocking_send_count; }
+  size_t getNonBlockingSendCount() const { return m_nonblocking_send_count; }
+  size_t getBlockingRecvCount() const { return m_blocking_recv_count; }
+  size_t getNonBlockingRecvCount() const { return m_nonblocking_recv_count; }
 
   // Copy vector data into pre-allocated TraceDataSoA
   void fillSoA(TraceDataSoA &data) const {
@@ -416,7 +430,7 @@ private:
 
 #ifdef USE_SCALASCA_TIMESTAMPS
   std::unordered_map<id_t, timestamp_t> m_last_enter_ts;
-  std::unordered_map<id_t, timestamp_t> m_irecv_enter_ts;
+  std::unordered_map<uint64_t, timestamp_t> m_irecv_enter_ts; // keyed by request_id
   std::unordered_map<id_t, timestamp_t> m_last_leave_ts;
   std::unordered_map<id_t, int64_t> m_last_send_soa_idx;
 #endif
@@ -424,6 +438,10 @@ private:
   size_t m_send_count = 0;
   size_t m_recv_count = 0;
   size_t m_coll_count = 0;
+  size_t m_blocking_send_count = 0;
+  size_t m_nonblocking_send_count = 0;
+  size_t m_blocking_recv_count = 0;
+  size_t m_nonblocking_recv_count = 0;
 
   void pushEvent(event_t ev, event_type_t type, timestamp_t ts,
                  timestamp_t end_ts, id_t pid, id_t src, id_t dst, id_t tag,
@@ -624,12 +642,25 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
   size_t local_sends = data_cb->getSendCount(),
          local_recvs = data_cb->getRecvCount(),
          local_colls = data_cb->getCollCount();
+  size_t local_bsend = data_cb->getBlockingSendCount(),
+         local_nbsend = data_cb->getNonBlockingSendCount(),
+         local_brecv = data_cb->getBlockingRecvCount(),
+         local_nbrecv = data_cb->getNonBlockingRecvCount();
   size_t total_sends = 0, total_recvs = 0, total_colls = 0;
+  size_t total_bsend = 0, total_nbsend = 0, total_brecv = 0, total_nbrecv = 0;
   MPI_Reduce(&local_sends, &total_sends, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
              MPI_COMM_WORLD);
   MPI_Reduce(&local_recvs, &total_recvs, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
              MPI_COMM_WORLD);
   MPI_Reduce(&local_colls, &total_colls, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_bsend, &total_bsend, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_nbsend, &total_nbsend, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_brecv, &total_brecv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_nbrecv, &total_nbrecv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
              MPI_COMM_WORLD);
 
   delete data_cb;
@@ -643,7 +674,9 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
               << std::endl;
     std::cout << "[Reader] Total events (global): "
               << total_sends + total_recvs + total_colls
-              << " (" << total_sends << " sends, " << total_recvs << " recvs, "
+              << " (" << total_sends << " sends [" << total_bsend << " blocking, "
+              << total_nbsend << " nonblocking], " << total_recvs << " recvs ["
+              << total_brecv << " blocking, " << total_nbrecv << " nonblocking], "
               << total_colls << " collectives)" << std::endl;
     std::cout << "[Reader] Local events on rank 0: " << output.data.count
               << std::endl;

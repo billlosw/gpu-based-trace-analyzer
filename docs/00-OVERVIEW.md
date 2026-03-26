@@ -101,4 +101,6 @@ Validated on CG Class B and CG Class C traces (64 locations). See [09-TESTING.md
 | [08-CUDA-KERNELS.md](./08-CUDA-KERNELS.md) | CUDA kernel designs, launch configs, GPU memory management |
 | [09-TESTING.md](./09-TESTING.md) | Test suite, validation methodology, comparison with Scalasca |
 | [10-HISTORY-AND-BUGS.md](./10-HISTORY-AND-BUGS.md) | Development history, bugs found and fixed |
+| [11-ARCHITECTURE-RESEARCH.md](./11-ARCHITECTURE-RESEARCH.md) | Architecture exploration and research notes |
+| [12-PERFORMANCE-COMPARISON.md](./12-PERFORMANCE-COMPARISON.md) | Performance comparison: GPU Analyzer vs Scalasca |
 | [PROBLEMS.md](./PROBLEMS.md) | Known issues, potential bugs, TODOs |
