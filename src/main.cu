@@ -1,5 +1,6 @@
 #include "analysis/AnalysisKernels.h"
 #include "analysis/Statistics.h"
+#include "analysis/TimestampCorrection.h"
 #include "common/cuda_check.h"
 #include "data/AnalysisResults.h"
 #include "matching/CollectiveGrouping.h"
@@ -457,13 +458,19 @@ int main(int argc, char **argv) {
 
   if (argc < 2) {
     if (mpi_rank == 0)
-      std::cerr << "Usage: " << argv[0] << " <path/to/traces.otf2>"
-                << std::endl;
+      std::cerr << "Usage: " << argv[0]
+                << " <path/to/traces.otf2> [--time-correct]" << std::endl;
     MPI_Finalize();
     return 1;
   }
 
   std::string trace_path = argv[1];
+  bool time_correct = false;
+  for (int i = 2; i < argc; i++) {
+    if (std::string(argv[i]) == "--time-correct") {
+      time_correct = true;
+    }
+  }
 
   if (mpi_rank == 0) {
     printGpuInfo();
@@ -479,6 +486,8 @@ int main(int argc, char **argv) {
     std::cout << "MPI ranks: " << mpi_size
               << " (distributed reading, adaptive batch streaming GPU analysis)"
               << std::endl;
+    if (time_correct)
+      std::cout << "Timestamp correction: ENABLED (--time-correct)" << std::endl;
     std::cout << std::endl;
   }
 
@@ -527,6 +536,35 @@ int main(int argc, char **argv) {
               << std::endl;
     std::cout << std::endl;
   }
+
+#ifdef USE_SCALASCA_TIMESTAMPS
+  // Step 3.5: Timestamp Correction (CLC)
+  // Applies clock condition filtering to fix inter-node clock skew.
+  // Only enabled with --time-correct flag (matching Scalasca's behavior).
+  double clc_ms = 0;
+  if (time_correct) {
+    if (mpi_rank == 0)
+      std::cout << "=== Step 3.5: Timestamp Correction (CLC) ===" << std::endl;
+    t1 = std::chrono::high_resolution_clock::now();
+    size_t local_violations = applyTimestampCorrection(reader_output.data);
+    t2 = std::chrono::high_resolution_clock::now();
+    clc_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    size_t total_violations = 0;
+    MPI_Reduce(&local_violations, &total_violations, 1, MPI_UNSIGNED_LONG,
+               MPI_SUM, 0, MPI_COMM_WORLD);
+    if (mpi_rank == 0) {
+      std::cout << "[CLC] Total violations across all ranks: "
+                << total_violations << std::endl;
+      std::cout << "[Timer] Timestamp correction: " << clc_ms << " ms"
+                << std::endl;
+      std::cout << std::endl;
+    }
+  } else {
+    if (mpi_rank == 0)
+      std::cout << "[CLC] Timestamp correction disabled (use --time-correct to enable)"
+                << std::endl << std::endl;
+  }
+#endif
 
   // Step 4+5: Adaptive Batch Streaming Analysis (Architecture C)
   // Replaces separate gather + GPU analysis steps. Processes K ranks per
@@ -604,6 +642,10 @@ int main(int argc, char **argv) {
               << read_ms << " ms" << std::endl;
     std::cout << "P2P Matching:         " << match_ms << " ms" << std::endl;
     std::cout << "Coll. Grouping:       " << group_ms << " ms" << std::endl;
+#ifdef USE_SCALASCA_TIMESTAMPS
+    if (time_correct)
+      std::cout << "Timestamp Correction: " << clc_ms << " ms" << std::endl;
+#endif
     std::cout << "Batch Analysis (GPU): " << analysis_ms << " ms" << std::endl;
     std::cout << "Statistics:           " << stats_ms << " ms" << std::endl;
     std::cout << "Total:                " << total_ms << " ms" << std::endl;

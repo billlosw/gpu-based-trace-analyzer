@@ -49,6 +49,9 @@ kernelLateSenderReceiver(const event_t *__restrict__ events,
     //                                          = Enter(MPI_Recv) for blocking
     // Condition: leave_sendcmp > enter_recvreq (sender still blocked when recv posted)
     // Duration:  enter_recvreq - enter_sendcmp (only counted when > 0)
+    //
+    // Note: Cross-node clock violations are handled in TimestampCorrection.cpp
+    // which adjusts end_timestamps for affected recv events before GPU analysis.
     {
       timestamp_t send_leave = end_timestamps[send_idx];   // Leave(MPI_Send)
       timestamp_t recv_req_enter = end_timestamps[i];      // Enter(MPI_Irecv) or Enter(MPI_Recv)

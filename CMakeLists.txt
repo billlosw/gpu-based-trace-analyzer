@@ -42,6 +42,7 @@ add_library(gpu_analyzer_lib STATIC
     src/matching/CollectiveGrouping.cpp
     src/analysis/AnalysisKernels.cu
     src/analysis/Statistics.cpp
+    src/analysis/TimestampCorrection.cpp
 )
 target_include_directories(gpu_analyzer_lib PUBLIC include/)
 target_link_libraries(gpu_analyzer_lib PUBLIC

@@ -1,6 +1,7 @@
 #include "reader/OTF2SoAReader.h"
 
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <tuple>
 #include <unordered_map>
@@ -222,9 +223,11 @@ public:
     id_t pid = loc.ref().get();
     auto it = m_last_enter_ts.find(pid);
     if (it != m_last_enter_ts.end()) {
-      // Key by request_id (not PID) to correctly handle multiple
-      // outstanding Irecvs per location.
-      m_irecv_enter_ts[event.request_id()] = it->second;
+      // Key by (pid, request_id) to handle request_id collisions
+      // across different locations (request_id is per-location, not global).
+      // Use a struct key to avoid truncation issues with large values.
+      auto key = std::make_pair(pid, event.request_id());
+      m_irecv_enter_ts[key] = it->second;
     }
   }
 #endif
@@ -240,9 +243,10 @@ public:
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
-    // Look up by request_id to get the correct Enter(MPI_Irecv)
+    // Look up by (pid, request_id) to get the correct Enter(MPI_Irecv)
     // timestamp even when multiple Irecvs are outstanding.
-    auto it2 = m_irecv_enter_ts.find(event.request_id());
+    auto key = std::make_pair(pid, event.request_id());
+    auto it2 = m_irecv_enter_ts.find(key);
     timestamp_t irecv_enter_ts =
         (it2 != m_irecv_enter_ts.end()) ? it2->second : enter_ts;
     if (it2 != m_irecv_enter_ts.end())
@@ -429,8 +433,17 @@ private:
   std::unordered_map<id_t, bool> m_coll_begin_valid;
 
 #ifdef USE_SCALASCA_TIMESTAMPS
+  // Hash for (pid, request_id) pair keys
+  struct PairHash {
+    size_t operator()(const std::pair<id_t, uint64_t> &p) const {
+      size_t h1 = std::hash<id_t>{}(p.first);
+      size_t h2 = std::hash<uint64_t>{}(p.second);
+      return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    }
+  };
+
   std::unordered_map<id_t, timestamp_t> m_last_enter_ts;
-  std::unordered_map<uint64_t, timestamp_t> m_irecv_enter_ts; // keyed by request_id
+  std::unordered_map<std::pair<id_t, uint64_t>, timestamp_t, PairHash> m_irecv_enter_ts;
   std::unordered_map<id_t, timestamp_t> m_last_leave_ts;
   std::unordered_map<id_t, int64_t> m_last_send_soa_idx;
 #endif
