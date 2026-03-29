@@ -1,8 +1,6 @@
 #include "matching/P2PMatching.h"
-#include "common/cuda_check.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <numeric>
@@ -10,21 +8,17 @@
 #include <unordered_map>
 #include <vector>
 
-#include <cuda_runtime.h>
-#include <iomanip>
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/sequence.h>
-#include <thrust/sort.h>
-
-// Threshold: use GPU sort when n exceeds this, otherwise std::sort
-static constexpr size_t GPU_SORT_THRESHOLD = 100000;
-
 // CPU-based P2P matching using timestamp-sorted events and FIFO queues.
 // This mirrors TileTrace's InteractionPattern::analysis() logic:
 // events are processed in timestamp order; for each send, we look for
 // a matching recv (same src, dst, tag) in the unmatched recv queue and
 // vice versa. This ensures correct temporal ordering of matches.
+//
+// Note on GPU sort: thrust::sort_by_key was tested but fails when 64 MPI
+// ranks compete for the same GPU (cudaErrorInvalidValue / OOM). The
+// matching loop itself is inherently sequential (FIFO queue state). Since
+// per-rank data is ~4M events and std::sort takes ~40ms without contention,
+// GPU sort is not worthwhile here.
 void runP2PMatching(TraceDataSoA &data) {
   size_t n = data.count;
   if (n == 0)
@@ -33,51 +27,10 @@ void runP2PMatching(TraceDataSoA &data) {
   // Build sorted index by timestamp
   std::vector<size_t> sorted_idx(n);
   std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
-
-  if (n > GPU_SORT_THRESHOLD) {
-    // GPU-accelerated sort using thrust::sort_by_key
-    // Use uint32_t indices on GPU (n < 4B), convert back to size_t after
-    auto t0 = std::chrono::high_resolution_clock::now();
-    bool gpu_ok = false;
-
-    try {
-      thrust::device_vector<timestamp_t> d_keys(data.timestamps,
-                                                 data.timestamps + n);
-      thrust::device_vector<uint32_t> d_vals(n);
-      thrust::sequence(d_vals.begin(), d_vals.end());
-
-      thrust::sort_by_key(d_keys.begin(), d_keys.end(), d_vals.begin());
-
-      // Copy sorted indices back to host
-      thrust::host_vector<uint32_t> h_vals = d_vals;
-      for (size_t i = 0; i < n; i++)
-        sorted_idx[i] = h_vals[i];
-      gpu_ok = true;
-    } catch (const std::exception &e) {
-      // Fall back to CPU sort if GPU sort fails (e.g., OOM, multi-process contention)
-      std::cerr << "[P2P Matching] GPU sort failed (" << e.what()
-                << "), falling back to CPU sort" << std::endl;
-      cudaGetLastError(); // clear any CUDA error state
-    }
-
-    if (!gpu_ok) {
-      std::sort(sorted_idx.begin(), sorted_idx.end(),
-                [&](size_t a, size_t b) {
-                  return data.timestamps[a] < data.timestamps[b];
-                });
-    }
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double sort_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
-    std::cout << "[P2P Matching] " << (gpu_ok ? "GPU" : "CPU") << " sort: "
-              << n << " events in " << std::fixed << std::setprecision(1)
-              << sort_ms << " ms" << std::endl;
-  } else {
-    std::sort(sorted_idx.begin(), sorted_idx.end(), [&](size_t a, size_t b) {
-      return data.timestamps[a] < data.timestamps[b];
-    });
-  }
+  std::sort(sorted_idx.begin(), sorted_idx.end(),
+            [&](size_t a, size_t b) {
+              return data.timestamps[a] < data.timestamps[b];
+            });
 
   // Queue-based matching with composite key = (sender, receiver, tag)
   // For Send: sender=pids[i], receiver=dsts[i], tag=tags[i]

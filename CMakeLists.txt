@@ -38,10 +38,10 @@ add_subdirectory(third_party/otf2xx)
 # Main library
 add_library(gpu_analyzer_lib STATIC
     src/reader/OTF2SoAReader.cpp
-    src/matching/P2PMatching.cu
+    src/matching/P2PMatching.cpp
     src/matching/CollectiveGrouping.cpp
     src/analysis/AnalysisKernels.cu
-    src/analysis/Statistics.cu
+    src/analysis/Statistics.cpp
     src/analysis/TimestampCorrection.cpp
 )
 target_include_directories(gpu_analyzer_lib PUBLIC include/)
