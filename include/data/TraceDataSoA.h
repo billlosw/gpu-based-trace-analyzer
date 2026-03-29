@@ -9,6 +9,7 @@
 struct TraceDataSoA {
   size_t count = 0;
   size_t capacity = 0;
+  bool owns_memory = true; // false when wrapping external (shared) memory
 
   // 12 base arrays
   event_t *events = nullptr;
@@ -68,28 +69,46 @@ struct TraceDataSoA {
   }
 
   void deallocate() {
+    if (owns_memory) {
 #define FREE_FIELD(field) \
   do {                    \
     free(field);          \
     field = nullptr;      \
   } while (0)
-    FREE_FIELD(events);
-    FREE_FIELD(types);
-    FREE_FIELD(timestamps);
-    FREE_FIELD(end_timestamps);
-    FREE_FIELD(pids);
-    FREE_FIELD(tids);
-    FREE_FIELD(replay_pids);
-    FREE_FIELD(srcs);
-    FREE_FIELD(dsts);
-    FREE_FIELD(tags);
-    FREE_FIELD(roots);
-    FREE_FIELD(indices);
-    FREE_FIELD(match_partner);
-    FREE_FIELD(coll_group_id);
+      FREE_FIELD(events);
+      FREE_FIELD(types);
+      FREE_FIELD(timestamps);
+      FREE_FIELD(end_timestamps);
+      FREE_FIELD(pids);
+      FREE_FIELD(tids);
+      FREE_FIELD(replay_pids);
+      FREE_FIELD(srcs);
+      FREE_FIELD(dsts);
+      FREE_FIELD(tags);
+      FREE_FIELD(roots);
+      FREE_FIELD(indices);
+      FREE_FIELD(match_partner);
+      FREE_FIELD(coll_group_id);
 #undef FREE_FIELD
+    } else {
+      events = nullptr;
+      types = nullptr;
+      timestamps = nullptr;
+      end_timestamps = nullptr;
+      pids = nullptr;
+      tids = nullptr;
+      replay_pids = nullptr;
+      srcs = nullptr;
+      dsts = nullptr;
+      tags = nullptr;
+      roots = nullptr;
+      indices = nullptr;
+      match_partner = nullptr;
+      coll_group_id = nullptr;
+    }
     count = 0;
     capacity = 0;
+    owns_memory = true;
   }
 
   size_t sizeInBytes() const {
@@ -102,6 +121,7 @@ private:
   void moveFrom(TraceDataSoA &o) {
     count = o.count;
     capacity = o.capacity;
+    owns_memory = o.owns_memory;
     events = o.events;
     types = o.types;
     timestamps = o.timestamps;
@@ -118,6 +138,7 @@ private:
     coll_group_id = o.coll_group_id;
     o.count = 0;
     o.capacity = 0;
+    o.owns_memory = true;
     o.events = nullptr;
     o.types = nullptr;
     o.timestamps = nullptr;

@@ -449,6 +449,356 @@ streamBatchAnalysis(TraceDataSoA &local_data, CollectiveGroupCSR &local_csr,
   return output;
 }
 
+// ============================================================
+// Architecture D: Shared Memory — Bypass MPI Gather
+// ============================================================
+// When all ranks share physical memory (same node), use MPI-3
+// shared memory windows. Each rank writes its SoA data directly
+// into a common buffer. Only a fence is needed for synchronization.
+// Falls back to Architecture C if ranks span multiple nodes.
+
+struct ShmSoALayout {
+  size_t total_bytes;
+  size_t events_off, types_off, timestamps_off, end_timestamps_off;
+  size_t pids_off, tids_off, replay_pids_off;
+  size_t srcs_off, dsts_off, tags_off, roots_off, indices_off;
+  size_t match_partner_off, coll_group_id_off;
+
+  static size_t align8(size_t x) { return (x + 7) & ~(size_t)7; }
+
+  void compute(size_t n) {
+    size_t off = 0;
+    events_off = off;         off += align8(n * sizeof(event_t));
+    types_off = off;          off += align8(n * sizeof(event_type_t));
+    timestamps_off = off;     off += align8(n * sizeof(timestamp_t));
+    end_timestamps_off = off; off += align8(n * sizeof(timestamp_t));
+    pids_off = off;           off += align8(n * sizeof(id_t));
+    tids_off = off;           off += align8(n * sizeof(id_t));
+    replay_pids_off = off;    off += align8(n * sizeof(id_t));
+    srcs_off = off;           off += align8(n * sizeof(id_t));
+    dsts_off = off;           off += align8(n * sizeof(id_t));
+    tags_off = off;           off += align8(n * sizeof(id_t));
+    roots_off = off;          off += align8(n * sizeof(id_t));
+    indices_off = off;        off += align8(n * sizeof(id_t));
+    match_partner_off = off;  off += align8(n * sizeof(int32_t));
+    coll_group_id_off = off;  off += align8(n * sizeof(int32_t));
+    total_bytes = off;
+  }
+};
+
+static RawAnalysisOutput
+sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
+                          CollectiveGroupCSR &local_csr, int rank,
+                          int nprocs) {
+  RawAnalysisOutput output;
+
+  // --- Phase 1: Create shared-memory communicator ---
+  MPI_Comm shm_comm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
+                      MPI_INFO_NULL, &shm_comm);
+  int shm_size;
+  MPI_Comm_size(shm_comm, &shm_size);
+
+  // Fallback if not all ranks share memory (multi-node)
+  if (shm_size != nprocs) {
+    if (rank == 0)
+      std::cerr << "[SHM] Only " << shm_size << "/" << nprocs
+                << " ranks share memory. Falling back to MPI Send/Recv."
+                << std::endl;
+    MPI_Comm_free(&shm_comm);
+    return streamBatchAnalysis(local_data, local_csr, rank, nprocs);
+  }
+
+  // --- Phase 2: Exchange event counts, compute offsets ---
+  int local_count = (int)local_data.count;
+  std::vector<int> all_counts(nprocs);
+  MPI_Allgather(&local_count, 1, MPI_INT, all_counts.data(), 1, MPI_INT,
+                shm_comm);
+
+  std::vector<size_t> soa_offsets(nprocs + 1);
+  size_t total_events = 0;
+  for (int i = 0; i < nprocs; i++) {
+    soa_offsets[i] = total_events;
+    total_events += all_counts[i];
+  }
+  soa_offsets[nprocs] = total_events;
+
+  if (total_events == 0) {
+    MPI_Comm_free(&shm_comm);
+    return output;
+  }
+
+  // --- Phase 3: Compute layout & allocate shared window ---
+  ShmSoALayout layout;
+  layout.compute(total_events);
+
+  if (rank == 0) {
+    std::cout << "[SHM] Shared memory mode: " << total_events
+              << " total events, " << (layout.total_bytes / (1024 * 1024))
+              << " MB shared buffer" << std::endl;
+  }
+
+  MPI_Win win;
+  void *base_ptr = nullptr;
+  MPI_Aint win_size = (rank == 0) ? (MPI_Aint)layout.total_bytes : 0;
+  MPI_Win_allocate_shared(win_size, 1, MPI_INFO_NULL, shm_comm, &base_ptr,
+                          &win);
+
+  if (rank != 0) {
+    MPI_Aint sz;
+    int disp;
+    MPI_Win_shared_query(win, 0, &sz, &disp, &base_ptr);
+  }
+  char *base = (char *)base_ptr;
+
+  // --- Phase 4: Each rank writes SoA data to shared buffer ---
+  MPI_Win_fence(0, win);
+
+  size_t my_off = soa_offsets[rank];
+  size_t my_cnt = local_data.count;
+
+  if (my_cnt > 0) {
+    memcpy((event_t *)(base + layout.events_off) + my_off, local_data.events,
+           my_cnt * sizeof(event_t));
+    memcpy((event_type_t *)(base + layout.types_off) + my_off,
+           local_data.types, my_cnt * sizeof(event_type_t));
+    memcpy((timestamp_t *)(base + layout.timestamps_off) + my_off,
+           local_data.timestamps, my_cnt * sizeof(timestamp_t));
+    memcpy((timestamp_t *)(base + layout.end_timestamps_off) + my_off,
+           local_data.end_timestamps, my_cnt * sizeof(timestamp_t));
+    memcpy((id_t *)(base + layout.pids_off) + my_off, local_data.pids,
+           my_cnt * sizeof(id_t));
+    memcpy((id_t *)(base + layout.tids_off) + my_off, local_data.tids,
+           my_cnt * sizeof(id_t));
+    memcpy((id_t *)(base + layout.replay_pids_off) + my_off,
+           local_data.replay_pids, my_cnt * sizeof(id_t));
+    memcpy((id_t *)(base + layout.srcs_off) + my_off, local_data.srcs,
+           my_cnt * sizeof(id_t));
+    memcpy((id_t *)(base + layout.dsts_off) + my_off, local_data.dsts,
+           my_cnt * sizeof(id_t));
+    memcpy((id_t *)(base + layout.tags_off) + my_off, local_data.tags,
+           my_cnt * sizeof(id_t));
+    memcpy((id_t *)(base + layout.roots_off) + my_off, local_data.roots,
+           my_cnt * sizeof(id_t));
+    memcpy((id_t *)(base + layout.indices_off) + my_off, local_data.indices,
+           my_cnt * sizeof(id_t));
+    memcpy((int32_t *)(base + layout.coll_group_id_off) + my_off,
+           local_data.coll_group_id, my_cnt * sizeof(int32_t));
+
+    // match_partner: remap to global indices before writing
+    int32_t *mp_dst =
+        (int32_t *)(base + layout.match_partner_off) + my_off;
+    for (size_t i = 0; i < my_cnt; i++) {
+      int32_t mp = local_data.match_partner[i];
+      mp_dst[i] = (mp >= 0) ? (int32_t)(mp + (int32_t)my_off) : -1;
+    }
+  }
+
+  MPI_Win_fence(0, win); // All data visible after this
+
+  // --- Phase 5: Gather CSR data via MPI_Gatherv (small data, <1 MB) ---
+  int csr_header[2] = {(int)local_csr.num_groups,
+                       (int)local_csr.total_members};
+  std::vector<int> all_csr_headers(nprocs * 2);
+  MPI_Allgather(csr_header, 2, MPI_INT, all_csr_headers.data(), 2, MPI_INT,
+                shm_comm);
+
+  std::vector<int> group_counts(nprocs), group_displs(nprocs + 1);
+  std::vector<int> member_counts(nprocs), member_displs(nprocs + 1);
+  size_t total_groups = 0, total_members_csr = 0;
+  for (int i = 0; i < nprocs; i++) {
+    group_counts[i] = all_csr_headers[2 * i];
+    member_counts[i] = all_csr_headers[2 * i + 1];
+    group_displs[i] = (int)total_groups;
+    member_displs[i] = (int)total_members_csr;
+    total_groups += group_counts[i];
+    total_members_csr += member_counts[i];
+  }
+  group_displs[nprocs] = (int)total_groups;
+  member_displs[nprocs] = (int)total_members_csr;
+
+  // Each rank prepares adjusted CSR arrays before Gatherv
+  // Members: add soa_offsets[rank] for global event indexing
+  std::vector<int32_t> adj_members(local_csr.total_members);
+  for (size_t i = 0; i < local_csr.total_members; i++)
+    adj_members[i] =
+        local_csr.members[i] + (int32_t)soa_offsets[rank];
+
+  // Offsets: add member_displs[rank] for global member indexing
+  std::vector<int32_t> adj_offsets(local_csr.num_groups);
+  for (size_t i = 0; i < local_csr.num_groups; i++)
+    adj_offsets[i] =
+        local_csr.offsets[i] + (int32_t)member_displs[rank];
+
+  // Group types: convert enum to int for MPI portability
+  std::vector<int> local_gt(local_csr.num_groups);
+  for (size_t i = 0; i < local_csr.num_groups; i++)
+    local_gt[i] = (int)local_csr.group_types[i];
+
+  // Gatherv all 4 CSR arrays to rank 0
+  std::vector<int32_t> merged_offsets_vec, merged_members_vec;
+  std::vector<int> merged_gt_vec;
+  std::vector<id_t> merged_roots_vec;
+  if (rank == 0 && total_groups > 0) {
+    merged_offsets_vec.resize(total_groups + 1);
+    merged_members_vec.resize(total_members_csr);
+    merged_gt_vec.resize(total_groups);
+    merged_roots_vec.resize(total_groups);
+  }
+
+  MPI_Gatherv(adj_offsets.data(), (int)local_csr.num_groups, MPI_INT32_T,
+              (total_groups > 0 && rank == 0) ? merged_offsets_vec.data()
+                                              : nullptr,
+              group_counts.data(), group_displs.data(), MPI_INT32_T, 0,
+              shm_comm);
+
+  MPI_Gatherv(adj_members.data(), (int)local_csr.total_members, MPI_INT32_T,
+              (total_members_csr > 0 && rank == 0) ? merged_members_vec.data()
+                                                   : nullptr,
+              member_counts.data(), member_displs.data(), MPI_INT32_T, 0,
+              shm_comm);
+
+  MPI_Gatherv(local_gt.data(), (int)local_csr.num_groups, MPI_INT,
+              (total_groups > 0 && rank == 0) ? merged_gt_vec.data() : nullptr,
+              group_counts.data(), group_displs.data(), MPI_INT, 0, shm_comm);
+
+  MPI_Gatherv(local_csr.group_roots, (int)local_csr.num_groups, MPI_UINT32_T,
+              (total_groups > 0 && rank == 0) ? merged_roots_vec.data()
+                                              : nullptr,
+              group_counts.data(), group_displs.data(), MPI_UINT32_T, 0,
+              shm_comm);
+
+  if (rank == 0 && total_groups > 0)
+    merged_offsets_vec[total_groups] = (int32_t)total_members_csr;
+
+  // --- Phase 6: Rank 0 runs batched GPU analysis ---
+  if (rank == 0) {
+    int K = computeBatchSize(all_counts, nprocs);
+    int num_batches = (nprocs + K - 1) / K;
+
+    std::cout << "[SHM] VRAM batch size K=" << K << ", " << num_batches
+              << " batch(es)" << std::endl;
+
+    for (int batch_start = 0; batch_start < nprocs; batch_start += K) {
+      int batch_end = std::min(batch_start + K, nprocs);
+
+      size_t batch_soa_off = soa_offsets[batch_start];
+      size_t batch_events =
+          soa_offsets[batch_end] - batch_soa_off;
+      int batch_group_off = group_displs[batch_start];
+      int batch_num_groups =
+          group_displs[batch_end] - batch_group_off;
+      int batch_member_off = member_displs[batch_start];
+      int batch_total_members =
+          member_displs[batch_end] - batch_member_off;
+
+      if (batch_events == 0)
+        continue;
+
+      // Create non-owning TraceDataSoA pointing into shared buffer
+      TraceDataSoA batch_soa;
+      batch_soa.owns_memory = false;
+      batch_soa.count = batch_events;
+      batch_soa.capacity = batch_events;
+      batch_soa.events =
+          (event_t *)(base + layout.events_off) + batch_soa_off;
+      batch_soa.types =
+          (event_type_t *)(base + layout.types_off) + batch_soa_off;
+      batch_soa.timestamps =
+          (timestamp_t *)(base + layout.timestamps_off) + batch_soa_off;
+      batch_soa.end_timestamps =
+          (timestamp_t *)(base + layout.end_timestamps_off) + batch_soa_off;
+      batch_soa.pids =
+          (id_t *)(base + layout.pids_off) + batch_soa_off;
+      batch_soa.tids =
+          (id_t *)(base + layout.tids_off) + batch_soa_off;
+      batch_soa.replay_pids =
+          (id_t *)(base + layout.replay_pids_off) + batch_soa_off;
+      batch_soa.srcs =
+          (id_t *)(base + layout.srcs_off) + batch_soa_off;
+      batch_soa.dsts =
+          (id_t *)(base + layout.dsts_off) + batch_soa_off;
+      batch_soa.tags =
+          (id_t *)(base + layout.tags_off) + batch_soa_off;
+      batch_soa.roots =
+          (id_t *)(base + layout.roots_off) + batch_soa_off;
+      batch_soa.indices =
+          (id_t *)(base + layout.indices_off) + batch_soa_off;
+      batch_soa.coll_group_id =
+          (int32_t *)(base + layout.coll_group_id_off) + batch_soa_off;
+
+      // match_partner: adjust global indices to batch-relative
+      int32_t *batch_mp =
+          (int32_t *)malloc(batch_events * sizeof(int32_t));
+      int32_t *shm_mp =
+          (int32_t *)(base + layout.match_partner_off) + batch_soa_off;
+      for (size_t i = 0; i < batch_events; i++) {
+        int32_t mp = shm_mp[i];
+        batch_mp[i] =
+            (mp >= 0) ? (int32_t)(mp - (int32_t)batch_soa_off) : -1;
+      }
+      batch_soa.match_partner = batch_mp;
+
+      // Build batch CSR with batch-relative indices
+      CollectiveGroupCSR batch_csr;
+      if (batch_num_groups > 0) {
+        batch_csr.num_groups = batch_num_groups;
+        batch_csr.total_members = batch_total_members;
+        batch_csr.offsets = (int32_t *)malloc(
+            (batch_num_groups + 1) * sizeof(int32_t));
+        batch_csr.members =
+            (int32_t *)malloc(batch_total_members * sizeof(int32_t));
+        batch_csr.group_types =
+            (event_t *)malloc(batch_num_groups * sizeof(event_t));
+        batch_csr.group_roots =
+            (id_t *)malloc(batch_num_groups * sizeof(id_t));
+
+        for (int g = 0; g < batch_num_groups; g++)
+          batch_csr.offsets[g] =
+              merged_offsets_vec[batch_group_off + g] - batch_member_off;
+        batch_csr.offsets[batch_num_groups] = batch_total_members;
+
+        for (int m = 0; m < batch_total_members; m++)
+          batch_csr.members[m] =
+              merged_members_vec[batch_member_off + m] -
+              (int32_t)batch_soa_off;
+
+        for (int g = 0; g < batch_num_groups; g++)
+          batch_csr.group_types[g] =
+              (event_t)merged_gt_vec[batch_group_off + g];
+
+        memcpy(batch_csr.group_roots,
+               merged_roots_vec.data() + batch_group_off,
+               batch_num_groups * sizeof(id_t));
+      }
+
+      RawAnalysisOutput batch_raw =
+          runAnalysisKernels(batch_soa, batch_csr);
+      accumulateResults(output, batch_raw);
+
+      if (num_batches > 1) {
+        std::cout << "[SHM] Batch " << (batch_start / K + 1) << "/"
+                  << num_batches << ": ranks " << batch_start << "-"
+                  << (batch_end - 1) << " (" << batch_events
+                  << " events), H2D=" << std::fixed
+                  << std::setprecision(2) << batch_raw.h2d_ms
+                  << " ms, P2P=" << batch_raw.p2p_kernel_ms
+                  << " ms, Coll=" << batch_raw.coll_kernel_ms << " ms"
+                  << std::endl;
+      }
+
+      // Free the match_partner copy (not owned by batch_soa)
+      free(batch_mp);
+      batch_soa.match_partner = nullptr;
+      // batch_csr destructor frees its malloc'd arrays
+    }
+  }
+
+  MPI_Win_free(&win);
+  MPI_Comm_free(&shm_comm);
+  return output;
+}
+
 int main(int argc, char **argv) {
   MPI_Init(&argc, &argv);
 
@@ -583,8 +933,9 @@ int main(int argc, char **argv) {
     // Single rank: analyze directly, no MPI communication needed
     raw = runAnalysisKernels(reader_output.data, csr);
   } else {
-    // Multi-rank: batch streaming
-    raw = streamBatchAnalysis(reader_output.data, csr, mpi_rank, mpi_size);
+    // Multi-rank: shared memory (same node) or MPI Send/Recv fallback
+    raw = sharedMemoryBatchAnalysis(reader_output.data, csr, mpi_rank,
+                                    mpi_size);
   }
 
   t2 = std::chrono::high_resolution_clock::now();
