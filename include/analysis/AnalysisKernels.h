@@ -18,11 +18,18 @@ struct RawAnalysisOutput {
   std::vector<double> wait_nxn;
   std::vector<double> nxn_completion;
 
-  // Sub-phase timing (ms)
+  // Sub-phase timing (ms) — GPU-side (cuda events)
   float h2d_ms = 0;
   float p2p_kernel_ms = 0;
   float coll_kernel_ms = 0;
   float d2h_ms = 0;
+  float gpu_alloc_ms = 0;   // cudaMalloc time
+  float gpu_free_ms = 0;    // cudaFree time
+
+  // Sub-phase timing (ms) — host-side (only used in batched GPU path)
+  float pin_ms = 0;         // cudaHostRegister per batch
+  float unpin_ms = 0;       // cudaHostUnregister per batch
+  float batch_prep_ms = 0;  // match_partner remap + CSR batch construction
 };
 
 RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,

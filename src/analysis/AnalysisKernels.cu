@@ -296,11 +296,14 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
     return output;
 
   // ---- CUDA event timing ----
-  cudaEvent_t ev_start, ev_h2d_done, ev_p2p_done, ev_coll_done;
+  cudaEvent_t ev_start, ev_alloc_done, ev_h2d_done, ev_p2p_done, ev_coll_done,
+              ev_d2h_done;
   CUDA_CHECK(cudaEventCreate(&ev_start));
+  CUDA_CHECK(cudaEventCreate(&ev_alloc_done));
   CUDA_CHECK(cudaEventCreate(&ev_h2d_done));
   CUDA_CHECK(cudaEventCreate(&ev_p2p_done));
   CUDA_CHECK(cudaEventCreate(&ev_coll_done));
+  CUDA_CHECK(cudaEventCreate(&ev_d2h_done));
 
   CUDA_CHECK(cudaEventRecord(ev_start));
 
@@ -316,6 +319,8 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   CUDA_CHECK(cudaMalloc(&d_match, n * sizeof(int32_t)));
   CUDA_CHECK(cudaMalloc(&d_pids, n * sizeof(id_t)));
   CUDA_CHECK(cudaMalloc(&d_roots, n * sizeof(id_t)));
+
+  CUDA_CHECK(cudaEventRecord(ev_alloc_done));
 
   CUDA_CHECK(cudaMemcpy(d_events, data.events, n * sizeof(event_t),
                          cudaMemcpyHostToDevice));
@@ -492,6 +497,9 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
     copyBack(output.wait_nxn, d_wn_out, h_wn_cnt);
     copyBack(output.nxn_completion, d_nc_out, h_nc_cnt);
 
+    CUDA_CHECK(cudaEventRecord(ev_d2h_done));
+    CUDA_CHECK(cudaEventSynchronize(ev_d2h_done));
+
     // Cleanup collective device memory
     CUDA_CHECK(cudaFree(d_coll_offsets));
     CUDA_CHECK(cudaFree(d_coll_members));
@@ -509,6 +517,10 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
     CUDA_CHECK(cudaFree(d_lb_cnt));
     CUDA_CHECK(cudaFree(d_wn_cnt));
     CUDA_CHECK(cudaFree(d_nc_cnt));
+  } else {
+    // No collectives: D2H already done above for P2P
+    CUDA_CHECK(cudaEventRecord(ev_d2h_done));
+    CUDA_CHECK(cudaEventSynchronize(ev_d2h_done));
   }
 
   // Cleanup trace device memory
@@ -520,17 +532,22 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   CUDA_CHECK(cudaFree(d_roots));
 
   // ---- Compute sub-phase timings ----
-  CUDA_CHECK(cudaEventSynchronize(ev_p2p_done));
-  CUDA_CHECK(cudaEventElapsedTime(&output.h2d_ms, ev_start, ev_h2d_done));
+  CUDA_CHECK(cudaEventElapsedTime(&output.gpu_alloc_ms, ev_start, ev_alloc_done));
+  CUDA_CHECK(cudaEventElapsedTime(&output.h2d_ms, ev_alloc_done, ev_h2d_done));
   CUDA_CHECK(cudaEventElapsedTime(&output.p2p_kernel_ms, ev_h2d_done, ev_p2p_done));
   if (csr.num_groups > 0) {
     CUDA_CHECK(cudaEventElapsedTime(&output.coll_kernel_ms, ev_p2p_done, ev_coll_done));
+    CUDA_CHECK(cudaEventElapsedTime(&output.d2h_ms, ev_coll_done, ev_d2h_done));
+  } else {
+    CUDA_CHECK(cudaEventElapsedTime(&output.d2h_ms, ev_p2p_done, ev_d2h_done));
   }
 
   CUDA_CHECK(cudaEventDestroy(ev_start));
+  CUDA_CHECK(cudaEventDestroy(ev_alloc_done));
   CUDA_CHECK(cudaEventDestroy(ev_h2d_done));
   CUDA_CHECK(cudaEventDestroy(ev_p2p_done));
   CUDA_CHECK(cudaEventDestroy(ev_coll_done));
+  CUDA_CHECK(cudaEventDestroy(ev_d2h_done));
 
   return output;
 }

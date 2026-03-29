@@ -329,6 +329,12 @@ static void accumulateResults(RawAnalysisOutput &total,
   total.h2d_ms += batch.h2d_ms;
   total.p2p_kernel_ms += batch.p2p_kernel_ms;
   total.coll_kernel_ms += batch.coll_kernel_ms;
+  total.d2h_ms += batch.d2h_ms;
+  total.gpu_alloc_ms += batch.gpu_alloc_ms;
+  total.gpu_free_ms += batch.gpu_free_ms;
+  total.pin_ms += batch.pin_ms;
+  total.unpin_ms += batch.unpin_ms;
+  total.batch_prep_ms += batch.batch_prep_ms;
 }
 
 // Compute adaptive batch size K based on available VRAM and per-rank data.
@@ -703,6 +709,9 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
     if (batch_events == 0)
       continue;
 
+    // --- Batch prep: match_partner remap + CSR construction ---
+    auto tp_prep0 = std::chrono::high_resolution_clock::now();
+
     // Non-owning TraceDataSoA pointing into shared buffer
     TraceDataSoA batch_soa;
     shmSetupLocalSoA(batch_soa, base, layout, batch_soa_off, batch_events);
@@ -717,46 +726,6 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
       batch_mp[i] = (mp >= 0) ? (int32_t)(mp - (int32_t)batch_soa_off) : -1;
     }
     batch_soa.match_partner = batch_mp;
-
-    // Per-batch pinning: pin only this batch's GPU-accessed arrays for DMA
-    // Skip if global pinning already covers the full buffer
-    int batch_n_pin = 0;
-    PinRegion batch_pin[6];
-    if (!global_pinned && batch_events > 0) {
-      size_t ev_bytes = batch_events * sizeof(event_t);
-      size_t ts_bytes = batch_events * sizeof(timestamp_t);
-      size_t id_bytes = batch_events * sizeof(id_t);
-      size_t mp_bytes = batch_events * sizeof(int32_t);
-
-      batch_pin[0] = {batch_soa.events, ev_bytes};
-      batch_pin[1] = {batch_soa.timestamps, ts_bytes};
-      batch_pin[2] = {batch_soa.end_timestamps, ts_bytes};
-      batch_pin[3] = {batch_mp, mp_bytes};
-      batch_pin[4] = {batch_soa.pids, id_bytes};
-      batch_pin[5] = {batch_soa.roots, id_bytes};
-      batch_n_pin = 6;
-
-      size_t pin_total = ev_bytes + 2 * ts_bytes + mp_bytes + 2 * id_bytes;
-      bool pin_ok = true;
-      for (int i = 0; i < batch_n_pin; i++) {
-        cudaError_t err = cudaHostRegister(batch_pin[i].ptr, batch_pin[i].len,
-                                           cudaHostRegisterDefault);
-        if (err != cudaSuccess) {
-          // Pinning failed — unpin what we did and proceed unpinned
-          cudaGetLastError();
-          for (int j = 0; j < i; j++)
-            cudaHostUnregister(batch_pin[j].ptr);
-          batch_n_pin = 0;
-          pin_ok = false;
-          break;
-        }
-      }
-      if (pin_ok && num_batches > 1) {
-        std::cout << "[SHM] Batch " << (batch_start / K + 1)
-                  << ": pinned " << (pin_total / (1024 * 1024))
-                  << " MB for DMA" << std::endl;
-      }
-    }
 
     // Build batch CSR with batch-relative indices
     CollectiveGroupCSR batch_csr;
@@ -790,14 +759,68 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
              batch_num_groups * sizeof(id_t));
     }
 
-    RawAnalysisOutput batch_raw = runAnalysisKernels(batch_soa, batch_csr);
-    accumulateResults(output, batch_raw);
+    auto tp_prep1 = std::chrono::high_resolution_clock::now();
+    float batch_prep_ms = (float)std::chrono::duration<double, std::milli>(tp_prep1 - tp_prep0).count();
 
-    // Unpin per-batch regions
+    // --- Per-batch pinning ---
+    auto tp_pin0 = std::chrono::high_resolution_clock::now();
+    int batch_n_pin = 0;
+    PinRegion batch_pin[6];
+    if (!global_pinned && batch_events > 0) {
+      size_t ev_bytes = batch_events * sizeof(event_t);
+      size_t ts_bytes = batch_events * sizeof(timestamp_t);
+      size_t id_bytes = batch_events * sizeof(id_t);
+      size_t mp_bytes = batch_events * sizeof(int32_t);
+
+      batch_pin[0] = {batch_soa.events, ev_bytes};
+      batch_pin[1] = {batch_soa.timestamps, ts_bytes};
+      batch_pin[2] = {batch_soa.end_timestamps, ts_bytes};
+      batch_pin[3] = {batch_mp, mp_bytes};
+      batch_pin[4] = {batch_soa.pids, id_bytes};
+      batch_pin[5] = {batch_soa.roots, id_bytes};
+      batch_n_pin = 6;
+
+      size_t pin_total = ev_bytes + 2 * ts_bytes + mp_bytes + 2 * id_bytes;
+      bool pin_ok = true;
+      for (int i = 0; i < batch_n_pin; i++) {
+        cudaError_t err = cudaHostRegister(batch_pin[i].ptr, batch_pin[i].len,
+                                           cudaHostRegisterDefault);
+        if (err != cudaSuccess) {
+          cudaGetLastError();
+          for (int j = 0; j < i; j++)
+            cudaHostUnregister(batch_pin[j].ptr);
+          batch_n_pin = 0;
+          pin_ok = false;
+          break;
+        }
+      }
+      if (pin_ok && num_batches > 1) {
+        std::cout << "[SHM] Batch " << (batch_start / K + 1)
+                  << ": pinned " << (pin_total / (1024 * 1024))
+                  << " MB for DMA" << std::endl;
+      }
+    }
+    auto tp_pin1 = std::chrono::high_resolution_clock::now();
+    float batch_pin_ms = (float)std::chrono::duration<double, std::milli>(tp_pin1 - tp_pin0).count();
+
+    // --- Run GPU kernels ---
+    RawAnalysisOutput batch_raw = runAnalysisKernels(batch_soa, batch_csr);
+
+    // --- Per-batch unpinning ---
+    auto tp_unpin0 = std::chrono::high_resolution_clock::now();
     if (batch_n_pin > 0) {
       for (int i = 0; i < batch_n_pin; i++)
         cudaHostUnregister(batch_pin[i].ptr);
     }
+    auto tp_unpin1 = std::chrono::high_resolution_clock::now();
+    float batch_unpin_ms = (float)std::chrono::duration<double, std::milli>(tp_unpin1 - tp_unpin0).count();
+
+    // Store host-side timing in batch_raw before accumulation
+    batch_raw.pin_ms = batch_pin_ms;
+    batch_raw.unpin_ms = batch_unpin_ms;
+    batch_raw.batch_prep_ms = batch_prep_ms;
+
+    accumulateResults(output, batch_raw);
 
     if (num_batches > 1) {
       std::cout << "[SHM] Batch " << (batch_start / K + 1) << "/"
@@ -1161,9 +1184,21 @@ int main(int argc, char **argv) {
     }
     std::cout << "[Timer] Analysis (total):  " << total_analysis_ms << " ms"
               << std::endl;
-    std::cout << "[Analysis] Sub-phases: H2D=" << raw.h2d_ms
-              << " ms, P2P kernel=" << raw.p2p_kernel_ms
-              << " ms, Coll kernels=" << raw.coll_kernel_ms << " ms"
+    float gpu_kernel_ms = raw.p2p_kernel_ms + raw.coll_kernel_ms;
+    float gpu_accounted = raw.batch_prep_ms + raw.pin_ms + raw.gpu_alloc_ms +
+                          raw.h2d_ms + gpu_kernel_ms + raw.d2h_ms +
+                          raw.unpin_ms;
+    float gpu_other_ms = (float)gpu_analysis_ms - gpu_accounted;
+    std::cout << "[Analysis] GPU breakdown: batch_prep=" << raw.batch_prep_ms
+              << " ms, pin=" << raw.pin_ms
+              << " ms, alloc=" << raw.gpu_alloc_ms
+              << " ms, H2D=" << raw.h2d_ms
+              << " ms, kernels=" << gpu_kernel_ms
+              << " ms (P2P=" << raw.p2p_kernel_ms
+              << " + Coll=" << raw.coll_kernel_ms
+              << "), D2H=" << raw.d2h_ms
+              << " ms, unpin=" << raw.unpin_ms
+              << " ms, other=" << gpu_other_ms << " ms"
               << std::endl;
     std::cout << std::endl;
   }
