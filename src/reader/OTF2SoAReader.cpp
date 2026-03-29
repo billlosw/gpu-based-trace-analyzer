@@ -390,6 +390,31 @@ public:
       data.indices[i] = (id_t)i;
   }
 
+  // Copy vector data into pre-set SoA pointers (no allocation).
+  // Caller must have set all 14 pointer fields and data.capacity.
+  void fillSoAInto(TraceDataSoA &data) const {
+    size_t n = m_v_events.size();
+    data.count = n;
+    if (n == 0) return;
+    std::memcpy(data.events, m_v_events.data(), n * sizeof(event_t));
+    std::memcpy(data.types, m_v_types.data(), n * sizeof(event_type_t));
+    std::memcpy(data.timestamps, m_v_timestamps.data(),
+                n * sizeof(timestamp_t));
+    std::memcpy(data.end_timestamps, m_v_end_timestamps.data(),
+                n * sizeof(timestamp_t));
+    std::memcpy(data.pids, m_v_pids.data(), n * sizeof(id_t));
+    std::memcpy(data.srcs, m_v_srcs.data(), n * sizeof(id_t));
+    std::memcpy(data.dsts, m_v_dsts.data(), n * sizeof(id_t));
+    std::memcpy(data.tags, m_v_tags.data(), n * sizeof(id_t));
+    std::memcpy(data.roots, m_v_roots.data(), n * sizeof(id_t));
+    std::memcpy(data.replay_pids, m_v_pids.data(), n * sizeof(id_t));
+    std::memset(data.tids, 0, n * sizeof(id_t));
+    for (size_t i = 0; i < n; i++)
+      data.indices[i] = (id_t)i;
+    std::memset(data.match_partner, 0xFF, n * sizeof(int32_t));
+    std::memset(data.coll_group_id, 0xFF, n * sizeof(int32_t));
+  }
+
   std::vector<std::vector<uint64_t>> &getCommSets() { return m_comm_sets; }
 
   // Append received collective events after redistribution
@@ -699,4 +724,141 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
   }
 
   return output;
+}
+
+// ============================================================
+// Split-phase reader API
+// ============================================================
+ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
+  ReaderPhase1Output result;
+  result.handle = nullptr;
+
+  int rank = 0, comm_sz = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
+
+  auto t_start = std::chrono::high_resolution_clock::now();
+
+  std::unordered_set<id_t> related_locs;
+  id_t start_loc = 0, end_loc = 0, nlocs = 0;
+
+  // ======== PASS 1: DISCOVERY ========
+  {
+    otf2::reader::reader rdr(trace_path, MPI_COMM_WORLD);
+    nlocs = rdr.num_locations();
+
+    auto [s, e] = traceRange(nlocs, comm_sz, rank);
+    start_loc = s;
+    end_loc = e;
+
+    if (rank == 0) {
+      std::cout << "[Reader] " << nlocs << " locations, " << comm_sz
+                << " ranks, pass 1 discovery..." << std::endl;
+    }
+
+    Pass1DiscoveryCallback cb(rdr, start_loc, end_loc, related_locs);
+    rdr.set_callback(cb);
+    rdr.read_definitions();
+    rdr.read_events();
+  }
+
+  auto t_pass1 = std::chrono::high_resolution_clock::now();
+  double pass1_ms =
+      std::chrono::duration<double, std::milli>(t_pass1 - t_start).count();
+
+  if (rank == 0) {
+    std::cout << "[Reader] Pass 1 done in " << pass1_ms << " ms" << std::endl;
+  }
+
+  // ======== PASS 2: DATA LOADING ========
+  CollRedistBuffers redist(comm_sz);
+  Pass2DataCallback *data_cb = nullptr;
+  {
+    otf2::reader::reader rdr2(trace_path, MPI_COMM_WORLD);
+
+    data_cb =
+        new Pass2DataCallback(rdr2, related_locs, start_loc, end_loc, nlocs,
+                              rank, comm_sz, redist);
+    rdr2.set_callback(*data_cb);
+    rdr2.read_definitions();
+    rdr2.read_events();
+  }
+
+  auto t_pass2 = std::chrono::high_resolution_clock::now();
+  double pass2_ms =
+      std::chrono::duration<double, std::milli>(t_pass2 - t_pass1).count();
+
+  if (rank == 0) {
+    std::cout << "[Reader] Pass 2 done in " << pass2_ms << " ms" << std::endl;
+  }
+
+  // ======== COLLECTIVE REDISTRIBUTION ========
+  if (comm_sz > 1) {
+    redistributeCollectives(*data_cb, redist, rank, comm_sz);
+  }
+
+  auto t_redist = std::chrono::high_resolution_clock::now();
+  double redist_ms =
+      std::chrono::duration<double, std::milli>(t_redist - t_pass2).count();
+
+  // Gather total counts for diagnostics
+  size_t local_sends = data_cb->getSendCount(),
+         local_recvs = data_cb->getRecvCount(),
+         local_colls = data_cb->getCollCount();
+  size_t local_bsend = data_cb->getBlockingSendCount(),
+         local_nbsend = data_cb->getNonBlockingSendCount(),
+         local_brecv = data_cb->getBlockingRecvCount(),
+         local_nbrecv = data_cb->getNonBlockingRecvCount();
+  size_t total_sends = 0, total_recvs = 0, total_colls = 0;
+  size_t total_bsend = 0, total_nbsend = 0, total_brecv = 0, total_nbrecv = 0;
+  MPI_Reduce(&local_sends, &total_sends, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_recvs, &total_recvs, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_colls, &total_colls, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_bsend, &total_bsend, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_nbsend, &total_nbsend, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_brecv, &total_brecv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&local_nbrecv, &total_nbrecv, 1, MPI_UNSIGNED_LONG, MPI_SUM, 0,
+             MPI_COMM_WORLD);
+
+  auto t_end = std::chrono::high_resolution_clock::now();
+  double total_ms =
+      std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+  if (rank == 0) {
+    std::cout << "[Reader] Collective redistribution: " << redist_ms << " ms"
+              << std::endl;
+    std::cout << "[Reader] Total events (global): "
+              << total_sends + total_recvs + total_colls << " ("
+              << total_sends << " sends [" << total_bsend << " blocking, "
+              << total_nbsend << " nonblocking], " << total_recvs << " recvs ["
+              << total_brecv << " blocking, " << total_nbrecv
+              << " nonblocking], " << total_colls << " collectives)"
+              << std::endl;
+    std::cout << "[Reader] Local events on rank 0: "
+              << data_cb->getEventCount() << std::endl;
+    std::cout << "[Reader] Total read time: " << total_ms << " ms (pass1="
+              << pass1_ms << ", pass2=" << pass2_ms << ", redist=" << redist_ms
+              << ")" << std::endl;
+  }
+
+  result.event_count = data_cb->getEventCount();
+  result.comm_sets = std::move(data_cb->getCommSets());
+  result.handle = static_cast<void *>(data_cb);
+  return result;
+}
+
+void readerFillSoA(void *handle, TraceDataSoA &data) {
+  auto *cb = static_cast<Pass2DataCallback *>(handle);
+  cb->fillSoAInto(data);
+}
+
+void readerRelease(void *handle) {
+  auto *cb = static_cast<Pass2DataCallback *>(handle);
+  delete cb;
 }
