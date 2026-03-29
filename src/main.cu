@@ -464,24 +464,29 @@ struct ShmSoALayout {
   size_t srcs_off, dsts_off, tags_off, roots_off, indices_off;
   size_t match_partner_off, coll_group_id_off;
 
-  static size_t align8(size_t x) { return (x + 7) & ~(size_t)7; }
+  // Page-align offsets so each sub-array can be independently pinned
+  // with cudaHostRegister (requires page-aligned ptr and size).
+  static size_t alignPage(size_t x) {
+    const size_t PAGE = 4096;
+    return (x + PAGE - 1) & ~(PAGE - 1);
+  }
 
   void compute(size_t n) {
     size_t off = 0;
-    events_off = off;         off += align8(n * sizeof(event_t));
-    types_off = off;          off += align8(n * sizeof(event_type_t));
-    timestamps_off = off;     off += align8(n * sizeof(timestamp_t));
-    end_timestamps_off = off; off += align8(n * sizeof(timestamp_t));
-    pids_off = off;           off += align8(n * sizeof(id_t));
-    tids_off = off;           off += align8(n * sizeof(id_t));
-    replay_pids_off = off;    off += align8(n * sizeof(id_t));
-    srcs_off = off;           off += align8(n * sizeof(id_t));
-    dsts_off = off;           off += align8(n * sizeof(id_t));
-    tags_off = off;           off += align8(n * sizeof(id_t));
-    roots_off = off;          off += align8(n * sizeof(id_t));
-    indices_off = off;        off += align8(n * sizeof(id_t));
-    match_partner_off = off;  off += align8(n * sizeof(int32_t));
-    coll_group_id_off = off;  off += align8(n * sizeof(int32_t));
+    events_off = off;         off += alignPage(n * sizeof(event_t));
+    types_off = off;          off += alignPage(n * sizeof(event_type_t));
+    timestamps_off = off;     off += alignPage(n * sizeof(timestamp_t));
+    end_timestamps_off = off; off += alignPage(n * sizeof(timestamp_t));
+    pids_off = off;           off += alignPage(n * sizeof(id_t));
+    tids_off = off;           off += alignPage(n * sizeof(id_t));
+    replay_pids_off = off;    off += alignPage(n * sizeof(id_t));
+    srcs_off = off;           off += alignPage(n * sizeof(id_t));
+    dsts_off = off;           off += alignPage(n * sizeof(id_t));
+    tags_off = off;           off += alignPage(n * sizeof(id_t));
+    roots_off = off;          off += alignPage(n * sizeof(id_t));
+    indices_off = off;        off += alignPage(n * sizeof(id_t));
+    match_partner_off = off;  off += alignPage(n * sizeof(int32_t));
+    coll_group_id_off = off;  off += alignPage(n * sizeof(int32_t));
     total_bytes = off;
   }
 };
@@ -595,6 +600,65 @@ sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
   }
 
   MPI_Win_fence(0, win); // All data visible after this
+
+  // Pin only the GPU-accessed arrays for fast DMA H2D transfers.
+  // Only 6 of 14 arrays are sent to GPU: events, timestamps,
+  // end_timestamps, match_partner, pids, roots.
+  // Pinning is only beneficial when total pin size < ~10 GB;
+  // beyond that, cudaHostRegister page-locking cost exceeds H2D savings.
+  bool pinned = false;
+  struct { void *ptr; size_t len; } pin_regions[6];
+  int n_pin = 0;
+  const size_t PIN_THRESHOLD = (size_t)10 * 1024 * 1024 * 1024; // 10 GB
+  if (rank == 0 && total_events > 0) {
+    pin_regions[0] = {base + layout.events_off,
+                      ShmSoALayout::alignPage(total_events * sizeof(event_t))};
+    pin_regions[1] = {base + layout.timestamps_off,
+                      ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
+    pin_regions[2] = {base + layout.end_timestamps_off,
+                      ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
+    pin_regions[3] = {base + layout.match_partner_off,
+                      ShmSoALayout::alignPage(total_events * sizeof(int32_t))};
+    pin_regions[4] = {base + layout.pids_off,
+                      ShmSoALayout::alignPage(total_events * sizeof(id_t))};
+    pin_regions[5] = {base + layout.roots_off,
+                      ShmSoALayout::alignPage(total_events * sizeof(id_t))};
+    n_pin = 6;
+    size_t total_pin_bytes = 0;
+    for (int i = 0; i < n_pin; i++)
+      total_pin_bytes += pin_regions[i].len;
+    if (total_pin_bytes > PIN_THRESHOLD) {
+      if (rank == 0)
+        std::cout << "[SHM] Skipping cudaHostRegister: pin size "
+                  << (total_pin_bytes / (1024 * 1024)) << " MB exceeds 10 GB threshold"
+                  << std::endl;
+      n_pin = 0;
+    }
+
+    if (n_pin > 0) {
+      bool all_ok = true;
+      for (int i = 0; i < n_pin; i++) {
+        cudaError_t err = cudaHostRegister(pin_regions[i].ptr,
+                                           pin_regions[i].len,
+                                           cudaHostRegisterDefault);
+        if (err != cudaSuccess) {
+          std::cerr << "[SHM] Warning: cudaHostRegister failed for region "
+                    << i << " (" << cudaGetErrorString(err) << ")" << std::endl;
+          cudaGetLastError();
+          for (int j = 0; j < i; j++)
+            cudaHostUnregister(pin_regions[j].ptr);
+          all_ok = false;
+          n_pin = 0;
+          break;
+        }
+      }
+      pinned = all_ok;
+      if (pinned)
+        std::cout << "[SHM] Pinned " << n_pin << " regions ("
+                  << (total_pin_bytes / (1024 * 1024)) << " MB) for DMA H2D"
+                  << std::endl;
+    }
+  }
 
   // --- Phase 5: Gather CSR data via MPI_Gatherv (small data, <1 MB) ---
   int csr_header[2] = {(int)local_csr.num_groups,
@@ -792,6 +856,12 @@ sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
       batch_soa.match_partner = nullptr;
       // batch_csr destructor frees its malloc'd arrays
     }
+  }
+
+  // Unpin before freeing the shared window
+  if (rank == 0 && pinned) {
+    for (int i = 0; i < n_pin; i++)
+      cudaHostUnregister(pin_regions[i].ptr);
   }
 
   MPI_Win_free(&win);
