@@ -683,6 +683,7 @@ static MergedCSR shmGatherCSR(const CollectiveGroupCSR &local_csr,
 
 // Run batched GPU analysis on shared memory data. Only rank 0 calls this.
 // Creates batch-relative TraceDataSoA views and CSR slices, runs kernels.
+// Uses pre-allocated GPU memory pool to avoid per-batch cudaMalloc/cudaFree.
 static RawAnalysisOutput
 shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
                  const std::vector<size_t> &soa_offsets,
@@ -695,6 +696,34 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
 
   std::cout << "[SHM] VRAM batch size K=" << K << ", " << num_batches
             << " batch(es)" << std::endl;
+
+  // Compute max batch sizes for pool pre-allocation
+  size_t max_batch_events = 0;
+  size_t max_batch_members = 0;
+  size_t max_batch_groups = 0;
+  for (int batch_start = 0; batch_start < nprocs; batch_start += K) {
+    int batch_end = std::min(batch_start + K, nprocs);
+    size_t batch_events = soa_offsets[batch_end] - soa_offsets[batch_start];
+    int batch_group_off = merged.group_displs[batch_start];
+    int batch_num_groups = merged.group_displs[batch_end] - batch_group_off;
+    int batch_member_off = merged.member_displs[batch_start];
+    int batch_total_members = merged.member_displs[batch_end] - batch_member_off;
+    if (batch_events > max_batch_events) max_batch_events = batch_events;
+    if ((size_t)batch_total_members > max_batch_members) max_batch_members = batch_total_members;
+    if ((size_t)batch_num_groups > max_batch_groups) max_batch_groups = batch_num_groups;
+  }
+
+  // Pre-allocate GPU memory pool once
+  auto tp_alloc0 = std::chrono::high_resolution_clock::now();
+  GPUMemoryPool pool;
+  pool.allocate(max_batch_events, max_batch_members, max_batch_groups);
+  cudaStream_t stream;
+  CUDA_CHECK(cudaStreamCreate(&stream));
+  auto tp_alloc1 = std::chrono::high_resolution_clock::now();
+  float pool_alloc_ms = (float)std::chrono::duration<double, std::milli>(tp_alloc1 - tp_alloc0).count();
+  std::cout << "[SHM] GPU pool allocated: " << (max_batch_events * 48 / (1024 * 1024))
+            << " MB device memory, took " << std::fixed << std::setprecision(1)
+            << pool_alloc_ms << " ms" << std::endl;
 
   for (int batch_start = 0; batch_start < nprocs; batch_start += K) {
     int batch_end = std::min(batch_start + K, nprocs);
@@ -762,7 +791,7 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
     auto tp_prep1 = std::chrono::high_resolution_clock::now();
     float batch_prep_ms = (float)std::chrono::duration<double, std::milli>(tp_prep1 - tp_prep0).count();
 
-    // --- Per-batch pinning ---
+    // --- Per-batch pinning (only if global pinning was skipped) ---
     auto tp_pin0 = std::chrono::high_resolution_clock::now();
     int batch_n_pin = 0;
     PinRegion batch_pin[6];
@@ -803,8 +832,8 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
     auto tp_pin1 = std::chrono::high_resolution_clock::now();
     float batch_pin_ms = (float)std::chrono::duration<double, std::milli>(tp_pin1 - tp_pin0).count();
 
-    // --- Run GPU kernels ---
-    RawAnalysisOutput batch_raw = runAnalysisKernels(batch_soa, batch_csr);
+    // --- Run GPU kernels (using pool + stream) ---
+    RawAnalysisOutput batch_raw = runAnalysisKernelsAsync(batch_soa, batch_csr, pool, stream);
 
     // --- Per-batch unpinning ---
     auto tp_unpin0 = std::chrono::high_resolution_clock::now();
@@ -835,6 +864,10 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
     free(batch_mp);
     batch_soa.match_partner = nullptr;
   }
+
+  // Cleanup pool + stream
+  CUDA_CHECK(cudaStreamDestroy(stream));
+  pool.deallocate();
 
   return output;
 }
@@ -996,7 +1029,7 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   tp1 = std::chrono::high_resolution_clock::now();
   t_remap_fence = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Pin host memory for DMA ---
+  // --- Pin host memory for DMA (after data is populated) ---
   tp0 = std::chrono::high_resolution_clock::now();
   PinRegion pin_regions[6];
   int n_pin = 0;

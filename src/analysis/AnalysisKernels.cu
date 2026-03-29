@@ -551,3 +551,251 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
 
   return output;
 }
+
+// ============================================================
+// GPU Memory Pool — pre-allocate once, reuse across batches
+// ============================================================
+void GPUMemoryPool::allocate(size_t max_n, size_t max_members, size_t max_groups) {
+  deallocate();
+  max_events = max_n;
+  max_coll_members = max_members;
+  max_coll_groups = max_groups;
+
+  if (max_n == 0) return;
+
+  // Trace input
+  CUDA_CHECK(cudaMalloc(&d_events, max_n * sizeof(event_t)));
+  CUDA_CHECK(cudaMalloc(&d_timestamps, max_n * sizeof(timestamp_t)));
+  CUDA_CHECK(cudaMalloc(&d_end_timestamps, max_n * sizeof(timestamp_t)));
+  CUDA_CHECK(cudaMalloc(&d_match, max_n * sizeof(int32_t)));
+  CUDA_CHECK(cudaMalloc(&d_pids, max_n * sizeof(id_t)));
+  CUDA_CHECK(cudaMalloc(&d_roots, max_n * sizeof(id_t)));
+
+  // P2P output (max_n each)
+  CUDA_CHECK(cudaMalloc(&d_ls_out, max_n * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_lr_out, max_n * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_ls_cnt, sizeof(unsigned int)));
+  CUDA_CHECK(cudaMalloc(&d_lr_cnt, sizeof(unsigned int)));
+
+  // Collective input
+  if (max_groups > 0) {
+    CUDA_CHECK(cudaMalloc(&d_coll_offsets, (max_groups + 1) * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_coll_members, max_members * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_group_types, max_groups * sizeof(event_t)));
+    CUDA_CHECK(cudaMalloc(&d_group_roots, max_groups * sizeof(id_t)));
+
+    // Collective output (max_members each)
+    CUDA_CHECK(cudaMalloc(&d_bw_out, max_members * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_bc_out, max_members * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_er_out, max_members * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_lb_out, max_members * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_wn_out, max_members * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_nc_out, max_members * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_bw_cnt, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_bc_cnt, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_er_cnt, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_lb_cnt, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_wn_cnt, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_nc_cnt, sizeof(unsigned int)));
+  }
+}
+
+void GPUMemoryPool::deallocate() {
+  if (max_events == 0) return;
+
+  cudaFree(d_events); cudaFree(d_timestamps); cudaFree(d_end_timestamps);
+  cudaFree(d_match); cudaFree(d_pids); cudaFree(d_roots);
+  cudaFree(d_ls_out); cudaFree(d_lr_out);
+  cudaFree(d_ls_cnt); cudaFree(d_lr_cnt);
+
+  if (max_coll_groups > 0) {
+    cudaFree(d_coll_offsets); cudaFree(d_coll_members);
+    cudaFree(d_group_types); cudaFree(d_group_roots);
+    cudaFree(d_bw_out); cudaFree(d_bc_out);
+    cudaFree(d_er_out); cudaFree(d_lb_out);
+    cudaFree(d_wn_out); cudaFree(d_nc_out);
+    cudaFree(d_bw_cnt); cudaFree(d_bc_cnt);
+    cudaFree(d_er_cnt); cudaFree(d_lb_cnt);
+    cudaFree(d_wn_cnt); cudaFree(d_nc_cnt);
+  }
+
+  d_events = nullptr; d_timestamps = nullptr; d_end_timestamps = nullptr;
+  d_match = nullptr; d_pids = nullptr; d_roots = nullptr;
+  d_ls_out = nullptr; d_lr_out = nullptr;
+  d_ls_cnt = nullptr; d_lr_cnt = nullptr;
+  d_coll_offsets = nullptr; d_coll_members = nullptr;
+  d_group_types = nullptr; d_group_roots = nullptr;
+  d_bw_out = nullptr; d_bc_out = nullptr;
+  d_er_out = nullptr; d_lb_out = nullptr;
+  d_wn_out = nullptr; d_nc_out = nullptr;
+  d_bw_cnt = nullptr; d_bc_cnt = nullptr;
+  d_er_cnt = nullptr; d_lb_cnt = nullptr;
+  d_wn_cnt = nullptr; d_nc_cnt = nullptr;
+  max_events = 0; max_coll_members = 0; max_coll_groups = 0;
+}
+
+// ============================================================
+// Async variant: uses pre-allocated pool + CUDA stream
+// ============================================================
+RawAnalysisOutput runAnalysisKernelsAsync(const TraceDataSoA &data,
+                                          const CollectiveGroupCSR &csr,
+                                          GPUMemoryPool &pool,
+                                          cudaStream_t stream) {
+  RawAnalysisOutput output;
+  size_t n = data.count;
+  if (n == 0) return output;
+
+  // CUDA event timing
+  cudaEvent_t ev_start, ev_h2d_done, ev_p2p_done, ev_coll_done, ev_d2h_done;
+  CUDA_CHECK(cudaEventCreate(&ev_start));
+  CUDA_CHECK(cudaEventCreate(&ev_h2d_done));
+  CUDA_CHECK(cudaEventCreate(&ev_p2p_done));
+  CUDA_CHECK(cudaEventCreate(&ev_coll_done));
+  CUDA_CHECK(cudaEventCreate(&ev_d2h_done));
+
+  CUDA_CHECK(cudaEventRecord(ev_start, stream));
+
+  // H2D using async memcpy on the given stream
+  CUDA_CHECK(cudaMemcpyAsync(pool.d_events, data.events, n * sizeof(event_t),
+                              cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pool.d_timestamps, data.timestamps,
+                              n * sizeof(timestamp_t), cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pool.d_end_timestamps, data.end_timestamps,
+                              n * sizeof(timestamp_t), cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pool.d_match, data.match_partner, n * sizeof(int32_t),
+                              cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pool.d_pids, data.pids, n * sizeof(id_t),
+                              cudaMemcpyHostToDevice, stream));
+  CUDA_CHECK(cudaMemcpyAsync(pool.d_roots, data.roots, n * sizeof(id_t),
+                              cudaMemcpyHostToDevice, stream));
+
+  CUDA_CHECK(cudaEventRecord(ev_h2d_done, stream));
+
+  // Reset P2P counters
+  CUDA_CHECK(cudaMemsetAsync(pool.d_ls_cnt, 0, sizeof(unsigned int), stream));
+  CUDA_CHECK(cudaMemsetAsync(pool.d_lr_cnt, 0, sizeof(unsigned int), stream));
+
+  // P2P kernel
+  int blockSize = 256;
+  int gridSize = (int)std::min((n + 255) / 256, (size_t)1024);
+  kernelLateSenderReceiver<<<gridSize, blockSize, 0, stream>>>(
+      pool.d_events, pool.d_timestamps, pool.d_end_timestamps, pool.d_match,
+      n, pool.d_ls_out, pool.d_ls_cnt, pool.d_lr_out, pool.d_lr_cnt);
+  CUDA_CHECK(cudaEventRecord(ev_p2p_done, stream));
+
+  // Sync stream to read P2P counts for D2H sizing
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  unsigned int h_ls_cnt = 0, h_lr_cnt = 0;
+  CUDA_CHECK(cudaMemcpy(&h_ls_cnt, pool.d_ls_cnt, sizeof(unsigned int),
+                         cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(&h_lr_cnt, pool.d_lr_cnt, sizeof(unsigned int),
+                         cudaMemcpyDeviceToHost));
+
+  if (h_ls_cnt > 0) {
+    output.late_sender.resize(h_ls_cnt);
+    CUDA_CHECK(cudaMemcpyAsync(output.late_sender.data(), pool.d_ls_out,
+                                h_ls_cnt * sizeof(double), cudaMemcpyDeviceToHost, stream));
+  }
+  if (h_lr_cnt > 0) {
+    output.late_receiver.resize(h_lr_cnt);
+    CUDA_CHECK(cudaMemcpyAsync(output.late_receiver.data(), pool.d_lr_out,
+                                h_lr_cnt * sizeof(double), cudaMemcpyDeviceToHost, stream));
+  }
+
+  // Collective analysis
+  if (csr.num_groups > 0) {
+    CUDA_CHECK(cudaMemcpyAsync(pool.d_coll_offsets, csr.offsets,
+                                (csr.num_groups + 1) * sizeof(int32_t),
+                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pool.d_coll_members, csr.members,
+                                csr.total_members * sizeof(int32_t),
+                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pool.d_group_types, csr.group_types,
+                                csr.num_groups * sizeof(event_t),
+                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pool.d_group_roots, csr.group_roots,
+                                csr.num_groups * sizeof(id_t),
+                                cudaMemcpyHostToDevice, stream));
+
+    CUDA_CHECK(cudaMemsetAsync(pool.d_bw_cnt, 0, sizeof(unsigned int), stream));
+    CUDA_CHECK(cudaMemsetAsync(pool.d_bc_cnt, 0, sizeof(unsigned int), stream));
+    CUDA_CHECK(cudaMemsetAsync(pool.d_er_cnt, 0, sizeof(unsigned int), stream));
+    CUDA_CHECK(cudaMemsetAsync(pool.d_lb_cnt, 0, sizeof(unsigned int), stream));
+    CUDA_CHECK(cudaMemsetAsync(pool.d_wn_cnt, 0, sizeof(unsigned int), stream));
+    CUDA_CHECK(cudaMemsetAsync(pool.d_nc_cnt, 0, sizeof(unsigned int), stream));
+
+    int coll_grid = (int)csr.num_groups;
+
+    kernelBarrierWaitCompletion<<<coll_grid, 1, 0, stream>>>(
+        pool.d_timestamps, pool.d_end_timestamps, pool.d_coll_offsets,
+        pool.d_coll_members, pool.d_group_types, csr.num_groups,
+        pool.d_bw_out, pool.d_bw_cnt, pool.d_bc_out, pool.d_bc_cnt);
+
+    kernelEarlyReduce<<<coll_grid, 1, 0, stream>>>(
+        pool.d_timestamps, pool.d_pids, pool.d_roots, pool.d_coll_offsets,
+        pool.d_coll_members, pool.d_group_types, pool.d_group_roots,
+        csr.num_groups, pool.d_er_out, pool.d_er_cnt);
+
+    kernelLateBroadcast<<<coll_grid, 1, 0, stream>>>(
+        pool.d_timestamps, pool.d_pids, pool.d_roots, pool.d_coll_offsets,
+        pool.d_coll_members, pool.d_group_types, pool.d_group_roots,
+        csr.num_groups, pool.d_lb_out, pool.d_lb_cnt);
+
+    kernelNxNWaitCompletion<<<coll_grid, 1, 0, stream>>>(
+        pool.d_timestamps, pool.d_end_timestamps, pool.d_coll_offsets,
+        pool.d_coll_members, pool.d_group_types, csr.num_groups,
+        pool.d_wn_out, pool.d_wn_cnt, pool.d_nc_out, pool.d_nc_cnt);
+
+    CUDA_CHECK(cudaEventRecord(ev_coll_done, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    unsigned int h_bw_cnt = 0, h_bc_cnt = 0, h_er_cnt = 0, h_lb_cnt = 0,
+                h_wn_cnt = 0, h_nc_cnt = 0;
+    CUDA_CHECK(cudaMemcpy(&h_bw_cnt, pool.d_bw_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_bc_cnt, pool.d_bc_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_er_cnt, pool.d_er_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_lb_cnt, pool.d_lb_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_wn_cnt, pool.d_wn_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_nc_cnt, pool.d_nc_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+    auto copyBack = [&stream](std::vector<double> &out, double *d_ptr, unsigned int cnt) {
+      if (cnt > 0) {
+        out.resize(cnt);
+        CUDA_CHECK(cudaMemcpyAsync(out.data(), d_ptr, cnt * sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream));
+      }
+    };
+    copyBack(output.barrier_wait, pool.d_bw_out, h_bw_cnt);
+    copyBack(output.barrier_completion, pool.d_bc_out, h_bc_cnt);
+    copyBack(output.early_reduce, pool.d_er_out, h_er_cnt);
+    copyBack(output.late_broadcast, pool.d_lb_out, h_lb_cnt);
+    copyBack(output.wait_nxn, pool.d_wn_out, h_wn_cnt);
+    copyBack(output.nxn_completion, pool.d_nc_out, h_nc_cnt);
+
+    CUDA_CHECK(cudaEventRecord(ev_d2h_done, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  } else {
+    CUDA_CHECK(cudaEventRecord(ev_d2h_done, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  }
+
+  // Timing
+  output.gpu_alloc_ms = 0; // pool already allocated
+  CUDA_CHECK(cudaEventElapsedTime(&output.h2d_ms, ev_start, ev_h2d_done));
+  CUDA_CHECK(cudaEventElapsedTime(&output.p2p_kernel_ms, ev_h2d_done, ev_p2p_done));
+  if (csr.num_groups > 0) {
+    CUDA_CHECK(cudaEventElapsedTime(&output.coll_kernel_ms, ev_p2p_done, ev_coll_done));
+    CUDA_CHECK(cudaEventElapsedTime(&output.d2h_ms, ev_coll_done, ev_d2h_done));
+  } else {
+    CUDA_CHECK(cudaEventElapsedTime(&output.d2h_ms, ev_p2p_done, ev_d2h_done));
+  }
+
+  CUDA_CHECK(cudaEventDestroy(ev_start));
+  CUDA_CHECK(cudaEventDestroy(ev_h2d_done));
+  CUDA_CHECK(cudaEventDestroy(ev_p2p_done));
+  CUDA_CHECK(cudaEventDestroy(ev_coll_done));
+  CUDA_CHECK(cudaEventDestroy(ev_d2h_done));
+
+  return output;
+}
