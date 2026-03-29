@@ -491,13 +491,292 @@ struct ShmSoALayout {
   }
 };
 
+// Timing info returned from shared memory analysis, separating
+// preprocessing (CPU-side data prep) from GPU analysis.
+struct ShmAnalysisResult {
+  RawAnalysisOutput raw;
+  double preprocess_ms = 0; // fill_soa + p2p + coll + ts_correct + remap + csr_gather + pinning
+  double gpu_analysis_ms = 0; // GPU batches only (H2D + kernels + D2H)
+  double cleanup_ms = 0;
+};
+
+// Set up a non-owning TraceDataSoA pointing at a rank's slice of the shared window.
+static void shmSetupLocalSoA(TraceDataSoA &soa, char *base,
+                              const ShmSoALayout &layout, size_t offset,
+                              size_t count) {
+  soa.owns_memory = false;
+  soa.capacity = count;
+  soa.events = (event_t *)(base + layout.events_off) + offset;
+  soa.types = (event_type_t *)(base + layout.types_off) + offset;
+  soa.timestamps = (timestamp_t *)(base + layout.timestamps_off) + offset;
+  soa.end_timestamps =
+      (timestamp_t *)(base + layout.end_timestamps_off) + offset;
+  soa.pids = (id_t *)(base + layout.pids_off) + offset;
+  soa.tids = (id_t *)(base + layout.tids_off) + offset;
+  soa.replay_pids = (id_t *)(base + layout.replay_pids_off) + offset;
+  soa.srcs = (id_t *)(base + layout.srcs_off) + offset;
+  soa.dsts = (id_t *)(base + layout.dsts_off) + offset;
+  soa.tags = (id_t *)(base + layout.tags_off) + offset;
+  soa.roots = (id_t *)(base + layout.roots_off) + offset;
+  soa.indices = (id_t *)(base + layout.indices_off) + offset;
+  soa.match_partner = (int32_t *)(base + layout.match_partner_off) + offset;
+  soa.coll_group_id = (int32_t *)(base + layout.coll_group_id_off) + offset;
+}
+
+// Pin the 6 GPU-accessed SoA arrays for DMA H2D transfers.
+// Returns the number of pinned regions (0 if skipped or failed).
+struct PinRegion {
+  void *ptr;
+  size_t len;
+};
+static int shmPinHostMemory(char *base, const ShmSoALayout &layout,
+                            size_t total_events, PinRegion *regions,
+                            int max_regions) {
+  const size_t PIN_THRESHOLD = (size_t)10 * 1024 * 1024 * 1024; // 10 GB
+  if (total_events == 0 || max_regions < 6)
+    return 0;
+
+  regions[0] = {base + layout.events_off,
+                ShmSoALayout::alignPage(total_events * sizeof(event_t))};
+  regions[1] = {base + layout.timestamps_off,
+                ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
+  regions[2] = {base + layout.end_timestamps_off,
+                ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
+  regions[3] = {base + layout.match_partner_off,
+                ShmSoALayout::alignPage(total_events * sizeof(int32_t))};
+  regions[4] = {base + layout.pids_off,
+                ShmSoALayout::alignPage(total_events * sizeof(id_t))};
+  regions[5] = {base + layout.roots_off,
+                ShmSoALayout::alignPage(total_events * sizeof(id_t))};
+  int n_pin = 6;
+
+  size_t total_pin_bytes = 0;
+  for (int i = 0; i < n_pin; i++)
+    total_pin_bytes += regions[i].len;
+
+  if (total_pin_bytes > PIN_THRESHOLD) {
+    std::cout << "[SHM] Skipping cudaHostRegister: pin size "
+              << (total_pin_bytes / (1024 * 1024))
+              << " MB exceeds 10 GB threshold" << std::endl;
+    return 0;
+  }
+
+  for (int i = 0; i < n_pin; i++) {
+    cudaError_t err =
+        cudaHostRegister(regions[i].ptr, regions[i].len, cudaHostRegisterDefault);
+    if (err != cudaSuccess) {
+      std::cerr << "[SHM] Warning: cudaHostRegister failed for region " << i
+                << " (" << cudaGetErrorString(err) << ")" << std::endl;
+      cudaGetLastError();
+      for (int j = 0; j < i; j++)
+        cudaHostUnregister(regions[j].ptr);
+      return 0;
+    }
+  }
+
+  std::cout << "[SHM] Pinned " << n_pin << " regions ("
+            << (total_pin_bytes / (1024 * 1024)) << " MB) for DMA H2D"
+            << std::endl;
+  return n_pin;
+}
+
+static void shmUnpinHostMemory(PinRegion *regions, int n_pin) {
+  for (int i = 0; i < n_pin; i++)
+    cudaHostUnregister(regions[i].ptr);
+}
+
+// Gather all ranks' CSR data to rank 0 via MPI_Gatherv.
+// Each rank adjusts its local CSR indices to global offsets before gathering.
+struct MergedCSR {
+  std::vector<int32_t> offsets, members;
+  std::vector<int> group_types;
+  std::vector<id_t> group_roots;
+  size_t total_groups = 0, total_members = 0;
+  std::vector<int> group_counts, group_displs;
+  std::vector<int> member_counts, member_displs;
+};
+
+static MergedCSR shmGatherCSR(const CollectiveGroupCSR &local_csr,
+                               const std::vector<size_t> &soa_offsets,
+                               int rank, int nprocs, MPI_Comm shm_comm) {
+  MergedCSR merged;
+
+  int csr_header[2] = {(int)local_csr.num_groups,
+                       (int)local_csr.total_members};
+  std::vector<int> all_csr_headers(nprocs * 2);
+  MPI_Allgather(csr_header, 2, MPI_INT, all_csr_headers.data(), 2, MPI_INT,
+                shm_comm);
+
+  merged.group_counts.resize(nprocs);
+  merged.group_displs.resize(nprocs + 1);
+  merged.member_counts.resize(nprocs);
+  merged.member_displs.resize(nprocs + 1);
+
+  for (int i = 0; i < nprocs; i++) {
+    merged.group_counts[i] = all_csr_headers[2 * i];
+    merged.member_counts[i] = all_csr_headers[2 * i + 1];
+    merged.group_displs[i] = (int)merged.total_groups;
+    merged.member_displs[i] = (int)merged.total_members;
+    merged.total_groups += merged.group_counts[i];
+    merged.total_members += merged.member_counts[i];
+  }
+  merged.group_displs[nprocs] = (int)merged.total_groups;
+  merged.member_displs[nprocs] = (int)merged.total_members;
+
+  // Adjust local CSR indices to global
+  std::vector<int32_t> adj_members(local_csr.total_members);
+  for (size_t i = 0; i < local_csr.total_members; i++)
+    adj_members[i] = local_csr.members[i] + (int32_t)soa_offsets[rank];
+
+  std::vector<int32_t> adj_offsets(local_csr.num_groups);
+  for (size_t i = 0; i < local_csr.num_groups; i++)
+    adj_offsets[i] =
+        local_csr.offsets[i] + (int32_t)merged.member_displs[rank];
+
+  std::vector<int> local_gt(local_csr.num_groups);
+  for (size_t i = 0; i < local_csr.num_groups; i++)
+    local_gt[i] = (int)local_csr.group_types[i];
+
+  if (rank == 0 && merged.total_groups > 0) {
+    merged.offsets.resize(merged.total_groups + 1);
+    merged.members.resize(merged.total_members);
+    merged.group_types.resize(merged.total_groups);
+    merged.group_roots.resize(merged.total_groups);
+  }
+
+  MPI_Gatherv(adj_offsets.data(), (int)local_csr.num_groups, MPI_INT32_T,
+              (merged.total_groups > 0 && rank == 0) ? merged.offsets.data()
+                                                     : nullptr,
+              merged.group_counts.data(), merged.group_displs.data(),
+              MPI_INT32_T, 0, shm_comm);
+
+  MPI_Gatherv(
+      adj_members.data(), (int)local_csr.total_members, MPI_INT32_T,
+      (merged.total_members > 0 && rank == 0) ? merged.members.data() : nullptr,
+      merged.member_counts.data(), merged.member_displs.data(), MPI_INT32_T, 0,
+      shm_comm);
+
+  MPI_Gatherv(local_gt.data(), (int)local_csr.num_groups, MPI_INT,
+              (merged.total_groups > 0 && rank == 0) ? merged.group_types.data()
+                                                     : nullptr,
+              merged.group_counts.data(), merged.group_displs.data(), MPI_INT,
+              0, shm_comm);
+
+  MPI_Gatherv(
+      local_csr.group_roots, (int)local_csr.num_groups, MPI_UINT32_T,
+      (merged.total_groups > 0 && rank == 0) ? merged.group_roots.data()
+                                             : nullptr,
+      merged.group_counts.data(), merged.group_displs.data(), MPI_UINT32_T, 0,
+      shm_comm);
+
+  if (rank == 0 && merged.total_groups > 0)
+    merged.offsets[merged.total_groups] = (int32_t)merged.total_members;
+
+  return merged;
+}
+
+// Run batched GPU analysis on shared memory data. Only rank 0 calls this.
+// Creates batch-relative TraceDataSoA views and CSR slices, runs kernels.
+static RawAnalysisOutput
+shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
+                 const std::vector<size_t> &soa_offsets,
+                 const std::vector<int> &all_counts, const MergedCSR &merged,
+                 int nprocs) {
+  RawAnalysisOutput output;
+
+  int K = computeBatchSize(all_counts, nprocs);
+  int num_batches = (nprocs + K - 1) / K;
+
+  std::cout << "[SHM] VRAM batch size K=" << K << ", " << num_batches
+            << " batch(es)" << std::endl;
+
+  for (int batch_start = 0; batch_start < nprocs; batch_start += K) {
+    int batch_end = std::min(batch_start + K, nprocs);
+
+    size_t batch_soa_off = soa_offsets[batch_start];
+    size_t batch_events = soa_offsets[batch_end] - batch_soa_off;
+    int batch_group_off = merged.group_displs[batch_start];
+    int batch_num_groups = merged.group_displs[batch_end] - batch_group_off;
+    int batch_member_off = merged.member_displs[batch_start];
+    int batch_total_members = merged.member_displs[batch_end] - batch_member_off;
+
+    if (batch_events == 0)
+      continue;
+
+    // Non-owning TraceDataSoA pointing into shared buffer
+    TraceDataSoA batch_soa;
+    shmSetupLocalSoA(batch_soa, base, layout, batch_soa_off, batch_events);
+    batch_soa.count = batch_events;
+
+    // match_partner: adjust global indices to batch-relative
+    int32_t *batch_mp = (int32_t *)malloc(batch_events * sizeof(int32_t));
+    int32_t *shm_mp =
+        (int32_t *)(base + layout.match_partner_off) + batch_soa_off;
+    for (size_t i = 0; i < batch_events; i++) {
+      int32_t mp = shm_mp[i];
+      batch_mp[i] = (mp >= 0) ? (int32_t)(mp - (int32_t)batch_soa_off) : -1;
+    }
+    batch_soa.match_partner = batch_mp;
+
+    // Build batch CSR with batch-relative indices
+    CollectiveGroupCSR batch_csr;
+    if (batch_num_groups > 0) {
+      batch_csr.num_groups = batch_num_groups;
+      batch_csr.total_members = batch_total_members;
+      batch_csr.offsets =
+          (int32_t *)malloc((batch_num_groups + 1) * sizeof(int32_t));
+      batch_csr.members =
+          (int32_t *)malloc(batch_total_members * sizeof(int32_t));
+      batch_csr.group_types =
+          (event_t *)malloc(batch_num_groups * sizeof(event_t));
+      batch_csr.group_roots =
+          (id_t *)malloc(batch_num_groups * sizeof(id_t));
+
+      for (int g = 0; g < batch_num_groups; g++)
+        batch_csr.offsets[g] =
+            merged.offsets[batch_group_off + g] - batch_member_off;
+      batch_csr.offsets[batch_num_groups] = batch_total_members;
+
+      for (int m = 0; m < batch_total_members; m++)
+        batch_csr.members[m] =
+            merged.members[batch_member_off + m] - (int32_t)batch_soa_off;
+
+      for (int g = 0; g < batch_num_groups; g++)
+        batch_csr.group_types[g] =
+            (event_t)merged.group_types[batch_group_off + g];
+
+      memcpy(batch_csr.group_roots,
+             merged.group_roots.data() + batch_group_off,
+             batch_num_groups * sizeof(id_t));
+    }
+
+    RawAnalysisOutput batch_raw = runAnalysisKernels(batch_soa, batch_csr);
+    accumulateResults(output, batch_raw);
+
+    if (num_batches > 1) {
+      std::cout << "[SHM] Batch " << (batch_start / K + 1) << "/"
+                << num_batches << ": ranks " << batch_start << "-"
+                << (batch_end - 1) << " (" << batch_events
+                << " events), H2D=" << std::fixed << std::setprecision(2)
+                << batch_raw.h2d_ms << " ms, P2P=" << batch_raw.p2p_kernel_ms
+                << " ms, Coll=" << batch_raw.coll_kernel_ms << " ms"
+                << std::endl;
+    }
+
+    free(batch_mp);
+    batch_soa.match_partner = nullptr;
+  }
+
+  return output;
+}
+
 // Direct-to-shared-memory analysis: reads OTF2 vectors directly into shared
 // window, then runs P2P matching, collective grouping, and timestamp correction
 // on the shared data before GPU analysis. Eliminates double memory allocation.
-static RawAnalysisOutput
+static ShmAnalysisResult
 sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
                            bool time_correct) {
-  RawAnalysisOutput output;
+  ShmAnalysisResult result;
   auto tp0 = std::chrono::high_resolution_clock::now();
   auto tp1 = tp0;
   double t_shm_split = 0, t_allgather = 0, t_win_alloc = 0, t_fill_soa = 0,
@@ -505,7 +784,7 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
          t_remap_fence = 0, t_pinning = 0, t_csr_gather = 0,
          t_gpu_batches = 0, t_cleanup = 0;
 
-  // --- Phase 1: Create shared-memory communicator ---
+  // --- Create shared-memory communicator ---
   tp0 = std::chrono::high_resolution_clock::now();
   MPI_Comm shm_comm;
   MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
@@ -522,7 +801,6 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
                 << " ranks share memory. Falling back to MPI Send/Recv."
                 << std::endl;
     MPI_Comm_free(&shm_comm);
-    // Fill into local calloc'd SoA and use legacy path
     TraceDataSoA local_data;
     local_data.allocate(phase1.event_count);
     readerFillSoA(phase1.handle, local_data);
@@ -535,10 +813,11 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
     if (time_correct)
       applyTimestampCorrection(local_data);
 #endif
-    return streamBatchAnalysis(local_data, local_csr, rank, nprocs);
+    result.raw = streamBatchAnalysis(local_data, local_csr, rank, nprocs);
+    return result;
   }
 
-  // --- Phase 2: Exchange event counts, compute offsets ---
+  // --- Exchange event counts, compute offsets ---
   tp0 = std::chrono::high_resolution_clock::now();
   int local_count = (int)phase1.event_count;
   std::vector<int> all_counts(nprocs);
@@ -559,10 +838,10 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
     readerRelease(phase1.handle);
     phase1.handle = nullptr;
     MPI_Comm_free(&shm_comm);
-    return output;
+    return result;
   }
 
-  // --- Phase 3: Compute layout & allocate shared window ---
+  // --- Compute layout & allocate shared window ---
   tp0 = std::chrono::high_resolution_clock::now();
   ShmSoALayout layout;
   layout.compute(total_events);
@@ -588,57 +867,36 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   tp1 = std::chrono::high_resolution_clock::now();
   t_win_alloc = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 4: Fill SoA directly into shared window ---
+  // --- Fill SoA directly into shared window ---
   tp0 = std::chrono::high_resolution_clock::now();
-  MPI_Win_fence(0, win); // start access epoch
+  MPI_Win_fence(0, win);
 
   size_t my_off = soa_offsets[rank];
   size_t my_cnt = phase1.event_count;
 
-  // Set up non-owning SoA pointing at this rank's slice
   TraceDataSoA local_data;
-  local_data.owns_memory = false;
-  local_data.capacity = my_cnt;
-  local_data.events = (event_t *)(base + layout.events_off) + my_off;
-  local_data.types = (event_type_t *)(base + layout.types_off) + my_off;
-  local_data.timestamps =
-      (timestamp_t *)(base + layout.timestamps_off) + my_off;
-  local_data.end_timestamps =
-      (timestamp_t *)(base + layout.end_timestamps_off) + my_off;
-  local_data.pids = (id_t *)(base + layout.pids_off) + my_off;
-  local_data.tids = (id_t *)(base + layout.tids_off) + my_off;
-  local_data.replay_pids = (id_t *)(base + layout.replay_pids_off) + my_off;
-  local_data.srcs = (id_t *)(base + layout.srcs_off) + my_off;
-  local_data.dsts = (id_t *)(base + layout.dsts_off) + my_off;
-  local_data.tags = (id_t *)(base + layout.tags_off) + my_off;
-  local_data.roots = (id_t *)(base + layout.roots_off) + my_off;
-  local_data.indices = (id_t *)(base + layout.indices_off) + my_off;
-  local_data.match_partner =
-      (int32_t *)(base + layout.match_partner_off) + my_off;
-  local_data.coll_group_id =
-      (int32_t *)(base + layout.coll_group_id_off) + my_off;
+  shmSetupLocalSoA(local_data, base, layout, my_off, my_cnt);
 
-  // Copy vectors directly into shared window (no intermediate calloc)
   readerFillSoA(phase1.handle, local_data);
   readerRelease(phase1.handle);
   phase1.handle = nullptr;
   tp1 = std::chrono::high_resolution_clock::now();
   t_fill_soa = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 5: P2P Matching (local, on shared window) ---
+  // --- P2P Matching (local, on shared window) ---
   tp0 = std::chrono::high_resolution_clock::now();
   runP2PMatching(local_data);
   tp1 = std::chrono::high_resolution_clock::now();
   t_p2p_match = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 6: Collective Grouping (local, on shared window) ---
+  // --- Collective Grouping (local, on shared window) ---
   tp0 = std::chrono::high_resolution_clock::now();
   CollectiveGroupCSR local_csr;
   buildCollectiveGroups(local_data, phase1.comm_sets, local_csr);
   tp1 = std::chrono::high_resolution_clock::now();
   t_coll_group = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 7: Timestamp Correction (conditional) ---
+  // --- Timestamp Correction (conditional) ---
 #ifdef USE_SCALASCA_TIMESTAMPS
   if (time_correct) {
     tp0 = std::chrono::high_resolution_clock::now();
@@ -656,7 +914,7 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   }
 #endif
 
-  // --- Phase 8: Remap match_partner to global + fence ---
+  // --- Remap match_partner to global + fence ---
   tp0 = std::chrono::high_resolution_clock::now();
   if (my_cnt > 0 && my_off > 0) {
     for (size_t i = 0; i < my_cnt; i++) {
@@ -665,328 +923,97 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
         local_data.match_partner[i] = mp + (int32_t)my_off;
     }
   }
-  MPI_Win_fence(0, win); // All data visible after this
+  MPI_Win_fence(0, win);
   tp1 = std::chrono::high_resolution_clock::now();
   t_remap_fence = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 9: Pinning (same heuristic as before) ---
+  // --- Pin host memory for DMA ---
   tp0 = std::chrono::high_resolution_clock::now();
-  bool pinned = false;
-  struct {
-    void *ptr;
-    size_t len;
-  } pin_regions[6];
+  PinRegion pin_regions[6];
   int n_pin = 0;
-  const size_t PIN_THRESHOLD = (size_t)10 * 1024 * 1024 * 1024; // 10 GB
-  if (rank == 0 && total_events > 0) {
-    pin_regions[0] = {base + layout.events_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(event_t))};
-    pin_regions[1] = {
-        base + layout.timestamps_off,
-        ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
-    pin_regions[2] = {
-        base + layout.end_timestamps_off,
-        ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
-    pin_regions[3] = {
-        base + layout.match_partner_off,
-        ShmSoALayout::alignPage(total_events * sizeof(int32_t))};
-    pin_regions[4] = {base + layout.pids_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(id_t))};
-    pin_regions[5] = {base + layout.roots_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(id_t))};
-    n_pin = 6;
-    size_t total_pin_bytes = 0;
-    for (int i = 0; i < n_pin; i++)
-      total_pin_bytes += pin_regions[i].len;
-    if (total_pin_bytes > PIN_THRESHOLD) {
-      if (rank == 0)
-        std::cout << "[SHM-Direct] Skipping cudaHostRegister: pin size "
-                  << (total_pin_bytes / (1024 * 1024))
-                  << " MB exceeds 10 GB threshold" << std::endl;
-      n_pin = 0;
-    }
-
-    if (n_pin > 0) {
-      bool all_ok = true;
-      for (int i = 0; i < n_pin; i++) {
-        cudaError_t err = cudaHostRegister(pin_regions[i].ptr,
-                                           pin_regions[i].len,
-                                           cudaHostRegisterDefault);
-        if (err != cudaSuccess) {
-          std::cerr << "[SHM-Direct] Warning: cudaHostRegister failed for "
-                       "region "
-                    << i << " (" << cudaGetErrorString(err) << ")" << std::endl;
-          cudaGetLastError();
-          for (int j = 0; j < i; j++)
-            cudaHostUnregister(pin_regions[j].ptr);
-          all_ok = false;
-          n_pin = 0;
-          break;
-        }
-      }
-      pinned = all_ok;
-      if (pinned)
-        std::cout << "[SHM-Direct] Pinned " << n_pin << " regions ("
-                  << (total_pin_bytes / (1024 * 1024)) << " MB) for DMA H2D"
-                  << std::endl;
-    }
-  }
+  if (rank == 0)
+    n_pin = shmPinHostMemory(base, layout, total_events, pin_regions, 6);
   tp1 = std::chrono::high_resolution_clock::now();
   t_pinning = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 10: Gather CSR data via MPI_Gatherv ---
+  // --- Gather CSR data via MPI_Gatherv ---
   tp0 = std::chrono::high_resolution_clock::now();
-  int csr_header[2] = {(int)local_csr.num_groups,
-                       (int)local_csr.total_members};
-  std::vector<int> all_csr_headers(nprocs * 2);
-  MPI_Allgather(csr_header, 2, MPI_INT, all_csr_headers.data(), 2, MPI_INT,
-                shm_comm);
-
-  std::vector<int> group_counts(nprocs), group_displs(nprocs + 1);
-  std::vector<int> member_counts(nprocs), member_displs(nprocs + 1);
-  size_t total_groups = 0, total_members_csr = 0;
-  for (int i = 0; i < nprocs; i++) {
-    group_counts[i] = all_csr_headers[2 * i];
-    member_counts[i] = all_csr_headers[2 * i + 1];
-    group_displs[i] = (int)total_groups;
-    member_displs[i] = (int)total_members_csr;
-    total_groups += group_counts[i];
-    total_members_csr += member_counts[i];
-  }
-  group_displs[nprocs] = (int)total_groups;
-  member_displs[nprocs] = (int)total_members_csr;
-
-  std::vector<int32_t> adj_members(local_csr.total_members);
-  for (size_t i = 0; i < local_csr.total_members; i++)
-    adj_members[i] = local_csr.members[i] + (int32_t)soa_offsets[rank];
-
-  std::vector<int32_t> adj_offsets(local_csr.num_groups);
-  for (size_t i = 0; i < local_csr.num_groups; i++)
-    adj_offsets[i] = local_csr.offsets[i] + (int32_t)member_displs[rank];
-
-  std::vector<int> local_gt(local_csr.num_groups);
-  for (size_t i = 0; i < local_csr.num_groups; i++)
-    local_gt[i] = (int)local_csr.group_types[i];
-
-  std::vector<int32_t> merged_offsets_vec, merged_members_vec;
-  std::vector<int> merged_gt_vec;
-  std::vector<id_t> merged_roots_vec;
-  if (rank == 0 && total_groups > 0) {
-    merged_offsets_vec.resize(total_groups + 1);
-    merged_members_vec.resize(total_members_csr);
-    merged_gt_vec.resize(total_groups);
-    merged_roots_vec.resize(total_groups);
-  }
-
-  MPI_Gatherv(adj_offsets.data(), (int)local_csr.num_groups, MPI_INT32_T,
-              (total_groups > 0 && rank == 0) ? merged_offsets_vec.data()
-                                              : nullptr,
-              group_counts.data(), group_displs.data(), MPI_INT32_T, 0,
-              shm_comm);
-
-  MPI_Gatherv(adj_members.data(), (int)local_csr.total_members, MPI_INT32_T,
-              (total_members_csr > 0 && rank == 0) ? merged_members_vec.data()
-                                                   : nullptr,
-              member_counts.data(), member_displs.data(), MPI_INT32_T, 0,
-              shm_comm);
-
-  MPI_Gatherv(local_gt.data(), (int)local_csr.num_groups, MPI_INT,
-              (total_groups > 0 && rank == 0) ? merged_gt_vec.data() : nullptr,
-              group_counts.data(), group_displs.data(), MPI_INT, 0, shm_comm);
-
-  MPI_Gatherv(local_csr.group_roots, (int)local_csr.num_groups, MPI_UINT32_T,
-              (total_groups > 0 && rank == 0) ? merged_roots_vec.data()
-                                              : nullptr,
-              group_counts.data(), group_displs.data(), MPI_UINT32_T, 0,
-              shm_comm);
-
-  if (rank == 0 && total_groups > 0)
-    merged_offsets_vec[total_groups] = (int32_t)total_members_csr;
+  MergedCSR merged =
+      shmGatherCSR(local_csr, soa_offsets, rank, nprocs, shm_comm);
   tp1 = std::chrono::high_resolution_clock::now();
   t_csr_gather = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 11: Rank 0 runs batched GPU analysis ---
+  // --- Rank 0 runs batched GPU analysis ---
   tp0 = std::chrono::high_resolution_clock::now();
   if (rank == 0) {
-    int K = computeBatchSize(all_counts, nprocs);
-    int num_batches = (nprocs + K - 1) / K;
-
-    std::cout << "[SHM-Direct] VRAM batch size K=" << K << ", " << num_batches
-              << " batch(es)" << std::endl;
-
-    for (int batch_start = 0; batch_start < nprocs; batch_start += K) {
-      int batch_end = std::min(batch_start + K, nprocs);
-
-      size_t batch_soa_off = soa_offsets[batch_start];
-      size_t batch_events = soa_offsets[batch_end] - batch_soa_off;
-      int batch_group_off = group_displs[batch_start];
-      int batch_num_groups = group_displs[batch_end] - batch_group_off;
-      int batch_member_off = member_displs[batch_start];
-      int batch_total_members = member_displs[batch_end] - batch_member_off;
-
-      if (batch_events == 0)
-        continue;
-
-      // Create non-owning TraceDataSoA pointing into shared buffer
-      TraceDataSoA batch_soa;
-      batch_soa.owns_memory = false;
-      batch_soa.count = batch_events;
-      batch_soa.capacity = batch_events;
-      batch_soa.events =
-          (event_t *)(base + layout.events_off) + batch_soa_off;
-      batch_soa.types =
-          (event_type_t *)(base + layout.types_off) + batch_soa_off;
-      batch_soa.timestamps =
-          (timestamp_t *)(base + layout.timestamps_off) + batch_soa_off;
-      batch_soa.end_timestamps =
-          (timestamp_t *)(base + layout.end_timestamps_off) + batch_soa_off;
-      batch_soa.pids = (id_t *)(base + layout.pids_off) + batch_soa_off;
-      batch_soa.tids = (id_t *)(base + layout.tids_off) + batch_soa_off;
-      batch_soa.replay_pids =
-          (id_t *)(base + layout.replay_pids_off) + batch_soa_off;
-      batch_soa.srcs = (id_t *)(base + layout.srcs_off) + batch_soa_off;
-      batch_soa.dsts = (id_t *)(base + layout.dsts_off) + batch_soa_off;
-      batch_soa.tags = (id_t *)(base + layout.tags_off) + batch_soa_off;
-      batch_soa.roots = (id_t *)(base + layout.roots_off) + batch_soa_off;
-      batch_soa.indices = (id_t *)(base + layout.indices_off) + batch_soa_off;
-      batch_soa.coll_group_id =
-          (int32_t *)(base + layout.coll_group_id_off) + batch_soa_off;
-
-      // match_partner: adjust global indices to batch-relative
-      int32_t *batch_mp =
-          (int32_t *)malloc(batch_events * sizeof(int32_t));
-      int32_t *shm_mp =
-          (int32_t *)(base + layout.match_partner_off) + batch_soa_off;
-      for (size_t i = 0; i < batch_events; i++) {
-        int32_t mp = shm_mp[i];
-        batch_mp[i] =
-            (mp >= 0) ? (int32_t)(mp - (int32_t)batch_soa_off) : -1;
-      }
-      batch_soa.match_partner = batch_mp;
-
-      // Build batch CSR with batch-relative indices
-      CollectiveGroupCSR batch_csr;
-      if (batch_num_groups > 0) {
-        batch_csr.num_groups = batch_num_groups;
-        batch_csr.total_members = batch_total_members;
-        batch_csr.offsets =
-            (int32_t *)malloc((batch_num_groups + 1) * sizeof(int32_t));
-        batch_csr.members =
-            (int32_t *)malloc(batch_total_members * sizeof(int32_t));
-        batch_csr.group_types =
-            (event_t *)malloc(batch_num_groups * sizeof(event_t));
-        batch_csr.group_roots =
-            (id_t *)malloc(batch_num_groups * sizeof(id_t));
-
-        for (int g = 0; g < batch_num_groups; g++)
-          batch_csr.offsets[g] =
-              merged_offsets_vec[batch_group_off + g] - batch_member_off;
-        batch_csr.offsets[batch_num_groups] = batch_total_members;
-
-        for (int m = 0; m < batch_total_members; m++)
-          batch_csr.members[m] = merged_members_vec[batch_member_off + m] -
-                                 (int32_t)batch_soa_off;
-
-        for (int g = 0; g < batch_num_groups; g++)
-          batch_csr.group_types[g] =
-              (event_t)merged_gt_vec[batch_group_off + g];
-
-        memcpy(batch_csr.group_roots,
-               merged_roots_vec.data() + batch_group_off,
-               batch_num_groups * sizeof(id_t));
-      }
-
-      RawAnalysisOutput batch_raw =
-          runAnalysisKernels(batch_soa, batch_csr);
-      accumulateResults(output, batch_raw);
-
-      if (num_batches > 1) {
-        std::cout << "[SHM-Direct] Batch " << (batch_start / K + 1) << "/"
-                  << num_batches << ": ranks " << batch_start << "-"
-                  << (batch_end - 1) << " (" << batch_events
-                  << " events), H2D=" << std::fixed << std::setprecision(2)
-                  << batch_raw.h2d_ms << " ms, P2P=" << batch_raw.p2p_kernel_ms
-                  << " ms, Coll=" << batch_raw.coll_kernel_ms << " ms"
-                  << std::endl;
-      }
-
-      free(batch_mp);
-      batch_soa.match_partner = nullptr;
-    }
+    result.raw = shmRunBatchedGPU(base, layout, soa_offsets, all_counts,
+                                  merged, nprocs);
   }
   tp1 = std::chrono::high_resolution_clock::now();
   t_gpu_batches = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 12: Cleanup ---
+  // --- Cleanup ---
   tp0 = std::chrono::high_resolution_clock::now();
-  if (rank == 0 && pinned) {
-    for (int i = 0; i < n_pin; i++)
-      cudaHostUnregister(pin_regions[i].ptr);
-  }
+  if (rank == 0 && n_pin > 0)
+    shmUnpinHostMemory(pin_regions, n_pin);
 
-  // Nullify local_data pointers before win_free (non-owning)
-  local_data.events = nullptr;
-  local_data.types = nullptr;
-  local_data.timestamps = nullptr;
-  local_data.end_timestamps = nullptr;
-  local_data.pids = nullptr;
-  local_data.tids = nullptr;
-  local_data.replay_pids = nullptr;
-  local_data.srcs = nullptr;
-  local_data.dsts = nullptr;
-  local_data.tags = nullptr;
-  local_data.roots = nullptr;
-  local_data.indices = nullptr;
-  local_data.match_partner = nullptr;
-  local_data.coll_group_id = nullptr;
+  // Nullify non-owning pointers before win_free
+  local_data.deallocate();
 
   MPI_Win_free(&win);
   MPI_Comm_free(&shm_comm);
   tp1 = std::chrono::high_resolution_clock::now();
   t_cleanup = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
+  // Compute aggregate timing categories
+  result.preprocess_ms = t_shm_split + t_allgather + t_win_alloc + t_fill_soa +
+                         t_p2p_match + t_coll_group + t_ts_correct +
+                         t_remap_fence + t_pinning + t_csr_gather;
+  result.gpu_analysis_ms = t_gpu_batches;
+  result.cleanup_ms = t_cleanup;
+
   if (rank == 0) {
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "[SHM-Direct Timing] shm_comm_split: " << t_shm_split
+    std::cout << "[SHM-Direct Preprocess] shm_comm_split: " << t_shm_split
               << " ms" << std::endl;
-    std::cout << "[SHM-Direct Timing] allgather:      " << t_allgather << " ms"
-              << std::endl;
-    std::cout << "[SHM-Direct Timing] win_allocate:   " << t_win_alloc << " ms"
-              << std::endl;
-    std::cout << "[SHM-Direct Timing] fill_soa:       " << t_fill_soa << " ms"
-              << std::endl;
-    std::cout << "[SHM-Direct Timing] p2p_matching:   " << t_p2p_match << " ms"
-              << std::endl;
-    std::cout << "[SHM-Direct Timing] coll_grouping:  " << t_coll_group
+    std::cout << "[SHM-Direct Preprocess] allgather:      " << t_allgather
               << " ms" << std::endl;
-    std::cout << "[SHM-Direct Timing] ts_correction:  " << t_ts_correct
+    std::cout << "[SHM-Direct Preprocess] win_allocate:   " << t_win_alloc
               << " ms" << std::endl;
-    std::cout << "[SHM-Direct Timing] remap+fence:    " << t_remap_fence
+    std::cout << "[SHM-Direct Preprocess] fill_soa:       " << t_fill_soa
               << " ms" << std::endl;
-    std::cout << "[SHM-Direct Timing] pinning:        " << t_pinning << " ms"
-              << std::endl;
-    std::cout << "[SHM-Direct Timing] csr_gather:     " << t_csr_gather
+    std::cout << "[SHM-Direct Preprocess] p2p_matching:   " << t_p2p_match
               << " ms" << std::endl;
-    std::cout << "[SHM-Direct Timing] gpu_batches:    " << t_gpu_batches
+    std::cout << "[SHM-Direct Preprocess] coll_grouping:  " << t_coll_group
               << " ms" << std::endl;
-    std::cout << "[SHM-Direct Timing] cleanup:        " << t_cleanup << " ms"
-              << std::endl;
+    std::cout << "[SHM-Direct Preprocess] ts_correction:  " << t_ts_correct
+              << " ms" << std::endl;
+    std::cout << "[SHM-Direct Preprocess] remap+fence:    " << t_remap_fence
+              << " ms" << std::endl;
+    std::cout << "[SHM-Direct Preprocess] pinning:        " << t_pinning
+              << " ms" << std::endl;
+    std::cout << "[SHM-Direct Preprocess] csr_gather:     " << t_csr_gather
+              << " ms" << std::endl;
+    std::cout << "[SHM-Direct GPU]        batches:        " << t_gpu_batches
+              << " ms" << std::endl;
+    std::cout << "[SHM-Direct Cleanup]    cleanup:        " << t_cleanup
+              << " ms" << std::endl;
   }
 
-  return output;
+  return result;
 }
 
-static RawAnalysisOutput
+static ShmAnalysisResult
 sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
                           CollectiveGroupCSR &local_csr, int rank,
                           int nprocs) {
-  RawAnalysisOutput output;
+  ShmAnalysisResult result;
   auto tp0 = std::chrono::high_resolution_clock::now();
   auto tp1 = tp0;
   double t_shm_split = 0, t_allgather = 0, t_win_alloc = 0, t_memcpy_fence = 0,
          t_pinning = 0, t_csr_gather = 0, t_gpu_batches = 0, t_cleanup = 0;
 
-  // --- Phase 1: Create shared-memory communicator ---
+  // --- Create shared-memory communicator ---
   tp0 = std::chrono::high_resolution_clock::now();
   MPI_Comm shm_comm;
   MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
@@ -1003,10 +1030,11 @@ sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
                 << " ranks share memory. Falling back to MPI Send/Recv."
                 << std::endl;
     MPI_Comm_free(&shm_comm);
-    return streamBatchAnalysis(local_data, local_csr, rank, nprocs);
+    result.raw = streamBatchAnalysis(local_data, local_csr, rank, nprocs);
+    return result;
   }
 
-  // --- Phase 2: Exchange event counts, compute offsets ---
+  // --- Exchange event counts, compute offsets ---
   tp0 = std::chrono::high_resolution_clock::now();
   int local_count = (int)local_data.count;
   std::vector<int> all_counts(nprocs);
@@ -1025,10 +1053,10 @@ sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
 
   if (total_events == 0) {
     MPI_Comm_free(&shm_comm);
-    return output;
+    return result;
   }
 
-  // --- Phase 3: Compute layout & allocate shared window ---
+  // --- Compute layout & allocate shared window ---
   tp0 = std::chrono::high_resolution_clock::now();
   ShmSoALayout layout;
   layout.compute(total_events);
@@ -1054,7 +1082,7 @@ sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
   tp1 = std::chrono::high_resolution_clock::now();
   t_win_alloc = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 4: Each rank writes SoA data to shared buffer ---
+  // --- Each rank writes SoA data to shared buffer ---
   tp0 = std::chrono::high_resolution_clock::now();
   MPI_Win_fence(0, win);
 
@@ -1098,301 +1126,63 @@ sharedMemoryBatchAnalysis(TraceDataSoA &local_data,
     }
   }
 
-  MPI_Win_fence(0, win); // All data visible after this
+  MPI_Win_fence(0, win);
   tp1 = std::chrono::high_resolution_clock::now();
   t_memcpy_fence = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // Pin only the GPU-accessed arrays for fast DMA H2D transfers.
+  // --- Pin host memory for DMA ---
   tp0 = std::chrono::high_resolution_clock::now();
-  // Only 6 of 14 arrays are sent to GPU: events, timestamps,
-  // end_timestamps, match_partner, pids, roots.
-  // Pinning is only beneficial when total pin size < ~10 GB;
-  // beyond that, cudaHostRegister page-locking cost exceeds H2D savings.
-  bool pinned = false;
-  struct { void *ptr; size_t len; } pin_regions[6];
+  PinRegion pin_regions[6];
   int n_pin = 0;
-  const size_t PIN_THRESHOLD = (size_t)10 * 1024 * 1024 * 1024; // 10 GB
-  if (rank == 0 && total_events > 0) {
-    pin_regions[0] = {base + layout.events_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(event_t))};
-    pin_regions[1] = {base + layout.timestamps_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
-    pin_regions[2] = {base + layout.end_timestamps_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
-    pin_regions[3] = {base + layout.match_partner_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(int32_t))};
-    pin_regions[4] = {base + layout.pids_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(id_t))};
-    pin_regions[5] = {base + layout.roots_off,
-                      ShmSoALayout::alignPage(total_events * sizeof(id_t))};
-    n_pin = 6;
-    size_t total_pin_bytes = 0;
-    for (int i = 0; i < n_pin; i++)
-      total_pin_bytes += pin_regions[i].len;
-    if (total_pin_bytes > PIN_THRESHOLD) {
-      if (rank == 0)
-        std::cout << "[SHM] Skipping cudaHostRegister: pin size "
-                  << (total_pin_bytes / (1024 * 1024)) << " MB exceeds 10 GB threshold"
-                  << std::endl;
-      n_pin = 0;
-    }
-
-    if (n_pin > 0) {
-      bool all_ok = true;
-      for (int i = 0; i < n_pin; i++) {
-        cudaError_t err = cudaHostRegister(pin_regions[i].ptr,
-                                           pin_regions[i].len,
-                                           cudaHostRegisterDefault);
-        if (err != cudaSuccess) {
-          std::cerr << "[SHM] Warning: cudaHostRegister failed for region "
-                    << i << " (" << cudaGetErrorString(err) << ")" << std::endl;
-          cudaGetLastError();
-          for (int j = 0; j < i; j++)
-            cudaHostUnregister(pin_regions[j].ptr);
-          all_ok = false;
-          n_pin = 0;
-          break;
-        }
-      }
-      pinned = all_ok;
-      if (pinned)
-        std::cout << "[SHM] Pinned " << n_pin << " regions ("
-                  << (total_pin_bytes / (1024 * 1024)) << " MB) for DMA H2D"
-                  << std::endl;
-    }
-  }
+  if (rank == 0)
+    n_pin = shmPinHostMemory(base, layout, total_events, pin_regions, 6);
   tp1 = std::chrono::high_resolution_clock::now();
   t_pinning = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 5: Gather CSR data via MPI_Gatherv (small data, <1 MB) ---
+  // --- Gather CSR data via MPI_Gatherv ---
   tp0 = std::chrono::high_resolution_clock::now();
-  int csr_header[2] = {(int)local_csr.num_groups,
-                       (int)local_csr.total_members};
-  std::vector<int> all_csr_headers(nprocs * 2);
-  MPI_Allgather(csr_header, 2, MPI_INT, all_csr_headers.data(), 2, MPI_INT,
-                shm_comm);
-
-  std::vector<int> group_counts(nprocs), group_displs(nprocs + 1);
-  std::vector<int> member_counts(nprocs), member_displs(nprocs + 1);
-  size_t total_groups = 0, total_members_csr = 0;
-  for (int i = 0; i < nprocs; i++) {
-    group_counts[i] = all_csr_headers[2 * i];
-    member_counts[i] = all_csr_headers[2 * i + 1];
-    group_displs[i] = (int)total_groups;
-    member_displs[i] = (int)total_members_csr;
-    total_groups += group_counts[i];
-    total_members_csr += member_counts[i];
-  }
-  group_displs[nprocs] = (int)total_groups;
-  member_displs[nprocs] = (int)total_members_csr;
-
-  // Each rank prepares adjusted CSR arrays before Gatherv
-  // Members: add soa_offsets[rank] for global event indexing
-  std::vector<int32_t> adj_members(local_csr.total_members);
-  for (size_t i = 0; i < local_csr.total_members; i++)
-    adj_members[i] =
-        local_csr.members[i] + (int32_t)soa_offsets[rank];
-
-  // Offsets: add member_displs[rank] for global member indexing
-  std::vector<int32_t> adj_offsets(local_csr.num_groups);
-  for (size_t i = 0; i < local_csr.num_groups; i++)
-    adj_offsets[i] =
-        local_csr.offsets[i] + (int32_t)member_displs[rank];
-
-  // Group types: convert enum to int for MPI portability
-  std::vector<int> local_gt(local_csr.num_groups);
-  for (size_t i = 0; i < local_csr.num_groups; i++)
-    local_gt[i] = (int)local_csr.group_types[i];
-
-  // Gatherv all 4 CSR arrays to rank 0
-  std::vector<int32_t> merged_offsets_vec, merged_members_vec;
-  std::vector<int> merged_gt_vec;
-  std::vector<id_t> merged_roots_vec;
-  if (rank == 0 && total_groups > 0) {
-    merged_offsets_vec.resize(total_groups + 1);
-    merged_members_vec.resize(total_members_csr);
-    merged_gt_vec.resize(total_groups);
-    merged_roots_vec.resize(total_groups);
-  }
-
-  MPI_Gatherv(adj_offsets.data(), (int)local_csr.num_groups, MPI_INT32_T,
-              (total_groups > 0 && rank == 0) ? merged_offsets_vec.data()
-                                              : nullptr,
-              group_counts.data(), group_displs.data(), MPI_INT32_T, 0,
-              shm_comm);
-
-  MPI_Gatherv(adj_members.data(), (int)local_csr.total_members, MPI_INT32_T,
-              (total_members_csr > 0 && rank == 0) ? merged_members_vec.data()
-                                                   : nullptr,
-              member_counts.data(), member_displs.data(), MPI_INT32_T, 0,
-              shm_comm);
-
-  MPI_Gatherv(local_gt.data(), (int)local_csr.num_groups, MPI_INT,
-              (total_groups > 0 && rank == 0) ? merged_gt_vec.data() : nullptr,
-              group_counts.data(), group_displs.data(), MPI_INT, 0, shm_comm);
-
-  MPI_Gatherv(local_csr.group_roots, (int)local_csr.num_groups, MPI_UINT32_T,
-              (total_groups > 0 && rank == 0) ? merged_roots_vec.data()
-                                              : nullptr,
-              group_counts.data(), group_displs.data(), MPI_UINT32_T, 0,
-              shm_comm);
-
-  if (rank == 0 && total_groups > 0)
-    merged_offsets_vec[total_groups] = (int32_t)total_members_csr;
+  MergedCSR merged =
+      shmGatherCSR(local_csr, soa_offsets, rank, nprocs, shm_comm);
   tp1 = std::chrono::high_resolution_clock::now();
   t_csr_gather = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Phase 6: Rank 0 runs batched GPU analysis ---
+  // --- Rank 0 runs batched GPU analysis ---
   tp0 = std::chrono::high_resolution_clock::now();
   if (rank == 0) {
-    int K = computeBatchSize(all_counts, nprocs);
-    int num_batches = (nprocs + K - 1) / K;
-
-    std::cout << "[SHM] VRAM batch size K=" << K << ", " << num_batches
-              << " batch(es)" << std::endl;
-
-    for (int batch_start = 0; batch_start < nprocs; batch_start += K) {
-      int batch_end = std::min(batch_start + K, nprocs);
-
-      size_t batch_soa_off = soa_offsets[batch_start];
-      size_t batch_events =
-          soa_offsets[batch_end] - batch_soa_off;
-      int batch_group_off = group_displs[batch_start];
-      int batch_num_groups =
-          group_displs[batch_end] - batch_group_off;
-      int batch_member_off = member_displs[batch_start];
-      int batch_total_members =
-          member_displs[batch_end] - batch_member_off;
-
-      if (batch_events == 0)
-        continue;
-
-      // Create non-owning TraceDataSoA pointing into shared buffer
-      TraceDataSoA batch_soa;
-      batch_soa.owns_memory = false;
-      batch_soa.count = batch_events;
-      batch_soa.capacity = batch_events;
-      batch_soa.events =
-          (event_t *)(base + layout.events_off) + batch_soa_off;
-      batch_soa.types =
-          (event_type_t *)(base + layout.types_off) + batch_soa_off;
-      batch_soa.timestamps =
-          (timestamp_t *)(base + layout.timestamps_off) + batch_soa_off;
-      batch_soa.end_timestamps =
-          (timestamp_t *)(base + layout.end_timestamps_off) + batch_soa_off;
-      batch_soa.pids =
-          (id_t *)(base + layout.pids_off) + batch_soa_off;
-      batch_soa.tids =
-          (id_t *)(base + layout.tids_off) + batch_soa_off;
-      batch_soa.replay_pids =
-          (id_t *)(base + layout.replay_pids_off) + batch_soa_off;
-      batch_soa.srcs =
-          (id_t *)(base + layout.srcs_off) + batch_soa_off;
-      batch_soa.dsts =
-          (id_t *)(base + layout.dsts_off) + batch_soa_off;
-      batch_soa.tags =
-          (id_t *)(base + layout.tags_off) + batch_soa_off;
-      batch_soa.roots =
-          (id_t *)(base + layout.roots_off) + batch_soa_off;
-      batch_soa.indices =
-          (id_t *)(base + layout.indices_off) + batch_soa_off;
-      batch_soa.coll_group_id =
-          (int32_t *)(base + layout.coll_group_id_off) + batch_soa_off;
-
-      // match_partner: adjust global indices to batch-relative
-      int32_t *batch_mp =
-          (int32_t *)malloc(batch_events * sizeof(int32_t));
-      int32_t *shm_mp =
-          (int32_t *)(base + layout.match_partner_off) + batch_soa_off;
-      for (size_t i = 0; i < batch_events; i++) {
-        int32_t mp = shm_mp[i];
-        batch_mp[i] =
-            (mp >= 0) ? (int32_t)(mp - (int32_t)batch_soa_off) : -1;
-      }
-      batch_soa.match_partner = batch_mp;
-
-      // Build batch CSR with batch-relative indices
-      CollectiveGroupCSR batch_csr;
-      if (batch_num_groups > 0) {
-        batch_csr.num_groups = batch_num_groups;
-        batch_csr.total_members = batch_total_members;
-        batch_csr.offsets = (int32_t *)malloc(
-            (batch_num_groups + 1) * sizeof(int32_t));
-        batch_csr.members =
-            (int32_t *)malloc(batch_total_members * sizeof(int32_t));
-        batch_csr.group_types =
-            (event_t *)malloc(batch_num_groups * sizeof(event_t));
-        batch_csr.group_roots =
-            (id_t *)malloc(batch_num_groups * sizeof(id_t));
-
-        for (int g = 0; g < batch_num_groups; g++)
-          batch_csr.offsets[g] =
-              merged_offsets_vec[batch_group_off + g] - batch_member_off;
-        batch_csr.offsets[batch_num_groups] = batch_total_members;
-
-        for (int m = 0; m < batch_total_members; m++)
-          batch_csr.members[m] =
-              merged_members_vec[batch_member_off + m] -
-              (int32_t)batch_soa_off;
-
-        for (int g = 0; g < batch_num_groups; g++)
-          batch_csr.group_types[g] =
-              (event_t)merged_gt_vec[batch_group_off + g];
-
-        memcpy(batch_csr.group_roots,
-               merged_roots_vec.data() + batch_group_off,
-               batch_num_groups * sizeof(id_t));
-      }
-
-      RawAnalysisOutput batch_raw =
-          runAnalysisKernels(batch_soa, batch_csr);
-      accumulateResults(output, batch_raw);
-
-      if (num_batches > 1) {
-        std::cout << "[SHM] Batch " << (batch_start / K + 1) << "/"
-                  << num_batches << ": ranks " << batch_start << "-"
-                  << (batch_end - 1) << " (" << batch_events
-                  << " events), H2D=" << std::fixed
-                  << std::setprecision(2) << batch_raw.h2d_ms
-                  << " ms, P2P=" << batch_raw.p2p_kernel_ms
-                  << " ms, Coll=" << batch_raw.coll_kernel_ms << " ms"
-                  << std::endl;
-      }
-
-      // Free the match_partner copy (not owned by batch_soa)
-      free(batch_mp);
-      batch_soa.match_partner = nullptr;
-      // batch_csr destructor frees its malloc'd arrays
-    }
+    result.raw = shmRunBatchedGPU(base, layout, soa_offsets, all_counts,
+                                  merged, nprocs);
   }
   tp1 = std::chrono::high_resolution_clock::now();
   t_gpu_batches = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // Unpin before freeing the shared window
+  // --- Cleanup ---
   tp0 = std::chrono::high_resolution_clock::now();
-  if (rank == 0 && pinned) {
-    for (int i = 0; i < n_pin; i++)
-      cudaHostUnregister(pin_regions[i].ptr);
-  }
+  if (rank == 0 && n_pin > 0)
+    shmUnpinHostMemory(pin_regions, n_pin);
 
   MPI_Win_free(&win);
   MPI_Comm_free(&shm_comm);
   tp1 = std::chrono::high_resolution_clock::now();
   t_cleanup = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
+  result.preprocess_ms = t_shm_split + t_allgather + t_win_alloc +
+                         t_memcpy_fence + t_pinning + t_csr_gather;
+  result.gpu_analysis_ms = t_gpu_batches;
+  result.cleanup_ms = t_cleanup;
+
   if (rank == 0) {
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "[SHM Timing] shm_comm_split: " << t_shm_split << " ms" << std::endl;
-    std::cout << "[SHM Timing] allgather:      " << t_allgather << " ms" << std::endl;
-    std::cout << "[SHM Timing] win_allocate:   " << t_win_alloc << " ms" << std::endl;
-    std::cout << "[SHM Timing] memcpy+fence:   " << t_memcpy_fence << " ms" << std::endl;
-    std::cout << "[SHM Timing] pinning:        " << t_pinning << " ms" << std::endl;
-    std::cout << "[SHM Timing] csr_gather:     " << t_csr_gather << " ms" << std::endl;
-    std::cout << "[SHM Timing] gpu_batches:    " << t_gpu_batches << " ms" << std::endl;
-    std::cout << "[SHM Timing] cleanup:        " << t_cleanup << " ms" << std::endl;
+    std::cout << "[SHM Preprocess] shm_comm_split: " << t_shm_split << " ms" << std::endl;
+    std::cout << "[SHM Preprocess] allgather:      " << t_allgather << " ms" << std::endl;
+    std::cout << "[SHM Preprocess] win_allocate:   " << t_win_alloc << " ms" << std::endl;
+    std::cout << "[SHM Preprocess] memcpy+fence:   " << t_memcpy_fence << " ms" << std::endl;
+    std::cout << "[SHM Preprocess] pinning:        " << t_pinning << " ms" << std::endl;
+    std::cout << "[SHM Preprocess] csr_gather:     " << t_csr_gather << " ms" << std::endl;
+    std::cout << "[SHM GPU]        batches:        " << t_gpu_batches << " ms" << std::endl;
+    std::cout << "[SHM Cleanup]    cleanup:        " << t_cleanup << " ms" << std::endl;
   }
 
-  return output;
+  return result;
 }
 
 int main(int argc, char **argv) {
@@ -1460,7 +1250,7 @@ int main(int argc, char **argv) {
   // and timestamp correction are done inside sharedMemoryDirectAnalysis
   // to operate directly on the shared window.
   RawAnalysisOutput raw;
-  double analysis_ms = 0;
+  double preprocess_ms = 0, gpu_analysis_ms = 0, cleanup_ms = 0;
   if (mpi_rank == 0)
     std::cout << "=== Step 2-4: Direct-to-SHM Analysis (GPU) ==="
               << std::endl;
@@ -1484,16 +1274,30 @@ int main(int argc, char **argv) {
     raw = runAnalysisKernels(local_data, csr);
   } else {
     // Multi-rank: direct-to-shared-memory analysis
-    raw = sharedMemoryDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct);
+    ShmAnalysisResult shm_result =
+        sharedMemoryDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct);
+    raw = std::move(shm_result.raw);
+    preprocess_ms = shm_result.preprocess_ms;
+    gpu_analysis_ms = shm_result.gpu_analysis_ms;
+    cleanup_ms = shm_result.cleanup_ms;
   }
 
   t2 = std::chrono::high_resolution_clock::now();
-  analysis_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+  double total_analysis_ms =
+      std::chrono::duration<double, std::milli>(t2 - t1).count();
   if (mpi_rank == 0) {
-    std::cout << "[Timer] Analysis (total): " << analysis_ms << " ms"
+    std::cout << std::fixed << std::setprecision(2);
+    if (mpi_size > 1) {
+      std::cout << "[Timer] Preprocess (CPU):  " << preprocess_ms << " ms"
+                << std::endl;
+      std::cout << "[Timer] GPU analysis:      " << gpu_analysis_ms << " ms"
+                << std::endl;
+      std::cout << "[Timer] Cleanup:           " << cleanup_ms << " ms"
+                << std::endl;
+    }
+    std::cout << "[Timer] Analysis (total):  " << total_analysis_ms << " ms"
               << std::endl;
-    std::cout << "[Analysis] Sub-phases: H2D=" << std::fixed
-              << std::setprecision(2) << raw.h2d_ms
+    std::cout << "[Analysis] Sub-phases: H2D=" << raw.h2d_ms
               << " ms, P2P kernel=" << raw.p2p_kernel_ms
               << " ms, Coll kernels=" << raw.coll_kernel_ms << " ms"
               << std::endl;
@@ -1540,7 +1344,12 @@ int main(int argc, char **argv) {
     std::cout << "=== Timing Summary ===" << std::endl;
     std::cout << "OTF2 Read:            " << std::fixed << std::setprecision(2)
               << read_ms << " ms" << std::endl;
-    std::cout << "Analysis (GPU):       " << analysis_ms << " ms" << std::endl;
+    if (mpi_size > 1) {
+      std::cout << "Preprocess (CPU):     " << preprocess_ms << " ms" << std::endl;
+      std::cout << "GPU Analysis:         " << gpu_analysis_ms << " ms" << std::endl;
+      std::cout << "Cleanup:              " << cleanup_ms << " ms" << std::endl;
+    }
+    std::cout << "Analysis (total):     " << total_analysis_ms << " ms" << std::endl;
     std::cout << "Statistics:           " << stats_ms << " ms" << std::endl;
     std::cout << "Total:                " << total_ms << " ms" << std::endl;
   }
