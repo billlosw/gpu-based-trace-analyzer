@@ -101,6 +101,7 @@ ALL RANKS (P processes)         RANK 0 ONLY
 - Correct results verified against Scalasca
 
 **Cons**:
+
 - O(N) memory on rank 0 — **hard scalability wall**
 - Network bottleneck: all P ranks send through one MPI_Gatherv
 - Gathering time grows linearly with N even as P increases

@@ -19,6 +19,7 @@
 
 #include <cuda_runtime.h>
 #include <mpi.h>
+#include <sys/mman.h>
 
 static void printGpuInfo() {
   int device;
@@ -881,9 +882,9 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   ShmAnalysisResult result;
   auto tp0 = std::chrono::high_resolution_clock::now();
   auto tp1 = tp0;
-  double t_shm_split = 0, t_allgather = 0, t_win_alloc = 0, t_fill_soa = 0,
-         t_p2p_match = 0, t_coll_group = 0, t_ts_correct = 0,
-         t_remap_fence = 0, t_pinning = 0, t_csr_gather = 0,
+  double t_shm_split = 0, t_allgather = 0, t_win_alloc = 0, t_prefault = 0,
+         t_fill_soa = 0, t_p2p_match = 0, t_coll_group = 0,
+         t_ts_correct = 0, t_remap_fence = 0, t_csr_gather = 0,
          t_gpu_batches = 0, t_cleanup = 0;
 
   // --- Create shared-memory communicator ---
@@ -969,6 +970,51 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   tp1 = std::chrono::high_resolution_clock::now();
   t_win_alloc = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
+  // --- Prefault shared memory + pin for GPU DMA ---
+  // SHM pages are lazily allocated by the OS. Writing to them during fill_soa
+  // causes ~5s of scattered page faults. Each rank prefaults its own slice in
+  // parallel, distributing the cost across all cores (~16GB/16 ranks = 1GB each).
+  // Also request huge pages (2MB THP) to reduce TLB miss rate.
+  // Pinning is done by rank 0 after all ranks finish prefaulting.
+  tp0 = std::chrono::high_resolution_clock::now();
+  PinRegion pin_regions[6];
+  int n_pin = 0;
+  {
+    // Rank 0 requests huge pages for the entire buffer
+    if (rank == 0)
+      madvise(base, layout.total_bytes, MADV_HUGEPAGE);
+    MPI_Barrier(shm_comm);
+
+    // Each rank prefaults its own slice of each array in parallel
+    size_t my_off = soa_offsets[rank];
+    size_t my_cnt = (size_t)all_counts[rank];
+    if (my_cnt > 0) {
+      memset((event_t *)(base + layout.events_off) + my_off, 0, my_cnt * sizeof(event_t));
+      memset((event_type_t *)(base + layout.types_off) + my_off, 0, my_cnt * sizeof(event_type_t));
+      memset((timestamp_t *)(base + layout.timestamps_off) + my_off, 0, my_cnt * sizeof(timestamp_t));
+      memset((timestamp_t *)(base + layout.end_timestamps_off) + my_off, 0, my_cnt * sizeof(timestamp_t));
+      memset((id_t *)(base + layout.pids_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((id_t *)(base + layout.tids_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((id_t *)(base + layout.replay_pids_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((id_t *)(base + layout.srcs_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((id_t *)(base + layout.dsts_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((id_t *)(base + layout.tags_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((id_t *)(base + layout.roots_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((id_t *)(base + layout.indices_off) + my_off, 0, my_cnt * sizeof(id_t));
+      memset((int32_t *)(base + layout.match_partner_off) + my_off, 0, my_cnt * sizeof(int32_t));
+      memset((int32_t *)(base + layout.coll_group_id_off) + my_off, 0, my_cnt * sizeof(int32_t));
+    }
+
+    MPI_Barrier(shm_comm);
+
+    // Rank 0 pins after all pages are faulted (hot pages → fast pin)
+    if (rank == 0)
+      n_pin = shmPinHostMemory(base, layout, total_events, pin_regions, 6);
+    MPI_Barrier(shm_comm);
+  }
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_prefault = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
   // --- Fill SoA directly into shared window ---
   tp0 = std::chrono::high_resolution_clock::now();
   MPI_Win_fence(0, win);
@@ -1029,14 +1075,7 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   tp1 = std::chrono::high_resolution_clock::now();
   t_remap_fence = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
-  // --- Pin host memory for DMA (after data is populated) ---
-  tp0 = std::chrono::high_resolution_clock::now();
-  PinRegion pin_regions[6];
-  int n_pin = 0;
-  if (rank == 0)
-    n_pin = shmPinHostMemory(base, layout, total_events, pin_regions, 6);
-  tp1 = std::chrono::high_resolution_clock::now();
-  t_pinning = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+  // (Pinning done during prefault step above — no separate pin needed)
 
   // --- Gather CSR data via MPI_Gatherv ---
   tp0 = std::chrono::high_resolution_clock::now();
@@ -1068,9 +1107,9 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   t_cleanup = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
   // Compute aggregate timing categories
-  result.preprocess_ms = t_shm_split + t_allgather + t_win_alloc + t_fill_soa +
-                         t_p2p_match + t_coll_group + t_ts_correct +
-                         t_remap_fence + t_pinning + t_csr_gather;
+  result.preprocess_ms = t_shm_split + t_allgather + t_win_alloc + t_prefault +
+                         t_fill_soa + t_p2p_match + t_coll_group +
+                         t_ts_correct + t_remap_fence + t_csr_gather;
   result.gpu_analysis_ms = t_gpu_batches;
   result.cleanup_ms = t_cleanup;
 
@@ -1082,6 +1121,8 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
               << " ms" << std::endl;
     std::cout << "[SHM-Direct Preprocess] win_allocate:   " << t_win_alloc
               << " ms" << std::endl;
+    std::cout << "[SHM-Direct Preprocess] prefault+pin:   " << t_prefault
+              << " ms" << std::endl;
     std::cout << "[SHM-Direct Preprocess] fill_soa:       " << t_fill_soa
               << " ms" << std::endl;
     std::cout << "[SHM-Direct Preprocess] p2p_matching:   " << t_p2p_match
@@ -1091,8 +1132,6 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
     std::cout << "[SHM-Direct Preprocess] ts_correction:  " << t_ts_correct
               << " ms" << std::endl;
     std::cout << "[SHM-Direct Preprocess] remap+fence:    " << t_remap_fence
-              << " ms" << std::endl;
-    std::cout << "[SHM-Direct Preprocess] pinning:        " << t_pinning
               << " ms" << std::endl;
     std::cout << "[SHM-Direct Preprocess] csr_gather:     " << t_csr_gather
               << " ms" << std::endl;

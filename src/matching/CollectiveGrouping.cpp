@@ -2,16 +2,39 @@
 
 #include <algorithm>
 #include <iostream>
-#include <map>
 #include <set>
 #include <unordered_map>
 #include <vector>
+
+// FNV-1a hash for a sorted comm_set.
+// Deterministic, fast, and has good distribution for integer sequences.
+static uint64_t hashCommSet(const std::vector<uint64_t> &sorted_cs) {
+  uint64_t h = 14695981039346656037ULL; // FNV offset basis
+  for (uint64_t v : sorted_cs) {
+    // Hash each byte of the 8-byte value
+    for (int b = 0; b < 8; b++) {
+      h ^= (v >> (b * 8)) & 0xFF;
+      h *= 1099511628211ULL; // FNV prime
+    }
+  }
+  return h;
+}
+
+// Combine event type and comm_set hash into a single lookup key.
+static uint64_t makePendingKey(int event_type, uint64_t cs_hash) {
+  // Mix event type into high bits to separate by type
+  return cs_hash ^ ((uint64_t)event_type * 2654435761ULL);
+}
 
 // Build collective groups from SoA data on the CPU.
 // Strategy: process collective events in timestamp order. For each event,
 // look for an open (incomplete) group with the same type and comm_set that
 // still needs this process's contribution. If found, add to it. Otherwise,
 // create a new group.
+//
+// Optimizations over the original:
+// 1. Hash-based lookup: O(1) amortized instead of linear scan over pending groups
+// 2. Comm_set caching: normalize (sort) each unique comm_set only once
 void buildCollectiveGroups(const TraceDataSoA &data,
                            const std::vector<std::vector<uint64_t>> &comm_sets,
                            CollectiveGroupCSR &out_csr) {
@@ -47,25 +70,41 @@ void buildCollectiveGroups(const TraceDataSoA &data,
               return data.timestamps[a] < data.timestamps[b];
             });
 
-  // Represent a comm_set as a sorted vector for use as a map key
-  auto normalizeCommSet = [](const std::vector<uint64_t> &cs) -> std::vector<uint64_t> {
-    std::vector<uint64_t> sorted_cs(cs);
-    std::sort(sorted_cs.begin(), sorted_cs.end());
-    return sorted_cs;
+  // Cache: comm_set_idx -> {sorted comm_set, hash}
+  // MPI programs typically have 1-3 communicators, so this cache is tiny
+  // but avoids millions of redundant sorts.
+  struct CachedCommSet {
+    std::vector<uint64_t> sorted_cs;
+    uint64_t hash;
+  };
+  std::unordered_map<size_t, CachedCommSet> cs_cache;
+
+  auto getCachedCommSet = [&](size_t cs_idx) -> const CachedCommSet & {
+    auto it = cs_cache.find(cs_idx);
+    if (it != cs_cache.end())
+      return it->second;
+    CachedCommSet &entry = cs_cache[cs_idx];
+    entry.sorted_cs = comm_sets[cs_idx];
+    std::sort(entry.sorted_cs.begin(), entry.sorted_cs.end());
+    entry.hash = hashCommSet(entry.sorted_cs);
+    return entry;
   };
 
   // Group tracking
   struct PendingGroup {
     event_t type;
     id_t root;
-    std::vector<uint64_t> comm_set_key; // sorted comm_set for identification
+    std::vector<uint64_t> comm_set_key; // sorted comm_set for collision check
+    uint64_t cs_hash;                   // pre-computed hash
     std::set<id_t> needed_pids;         // PIDs still expected
     std::vector<size_t> member_indices;  // SoA event indices
     size_t expected_size;
   };
 
-  // Key: event_type -> list of pending groups
-  std::unordered_map<int, std::vector<PendingGroup>> pending_by_type;
+  // Hash-based lookup: pending_key -> list of pending group indices
+  // pending_key combines event_type and comm_set_hash
+  std::unordered_map<uint64_t, std::vector<size_t>> pending_by_key;
+  std::vector<PendingGroup> all_pending; // pool of all pending groups
   std::vector<PendingGroup> completed_groups;
 
   for (size_t ci = 0; ci < coll_indices.size(); ci++) {
@@ -74,55 +113,62 @@ void buildCollectiveGroups(const TraceDataSoA &data,
     id_t pid = data.pids[ev_idx];
     id_t root = data.roots[ev_idx];
 
-    // Get comm_set for this event
-    std::vector<uint64_t> cs_key;
-    size_t expected = 0;
+    // Get comm_set for this event (with caching)
     auto cs_it = soa_to_commset.find(ev_idx);
-    if (cs_it != soa_to_commset.end() && cs_it->second < comm_sets.size()) {
-      cs_key = normalizeCommSet(comm_sets[cs_it->second]);
-      expected = cs_key.size();
-    }
-
-    if (cs_key.empty() || expected == 0)
+    if (cs_it == soa_to_commset.end() || cs_it->second >= comm_sets.size())
       continue;
 
-    int type_key = (int)etype;
+    const CachedCommSet &cached = getCachedCommSet(cs_it->second);
+    if (cached.sorted_cs.empty())
+      continue;
+
+    uint64_t pkey = makePendingKey((int)etype, cached.hash);
     bool matched = false;
 
-    // Try to find a pending group of the same type with matching comm_set
-    // that still needs this pid
-    auto &plist = pending_by_type[type_key];
-    for (auto &pg : plist) {
-      if (pg.comm_set_key == cs_key && pg.needed_pids.count(pid)) {
-        pg.member_indices.push_back(ev_idx);
-        pg.needed_pids.erase(pid);
+    // O(1) amortized lookup: find pending groups with same type+hash
+    auto pit = pending_by_key.find(pkey);
+    if (pit != pending_by_key.end()) {
+      auto &idx_list = pit->second;
+      for (size_t li = 0; li < idx_list.size(); li++) {
+        size_t pg_idx = idx_list[li];
+        PendingGroup &pg = all_pending[pg_idx];
 
-        if (pg.needed_pids.empty()) {
-          // Group complete
-          completed_groups.push_back(std::move(pg));
-          pg.expected_size = 0; // Mark for removal
+        // Hash collision check: verify exact comm_set match
+        if (pg.cs_hash == cached.hash &&
+            pg.comm_set_key == cached.sorted_cs &&
+            pg.needed_pids.count(pid)) {
+          pg.member_indices.push_back(ev_idx);
+          pg.needed_pids.erase(pid);
+
+          if (pg.needed_pids.empty()) {
+            // Group complete — move to completed, remove from pending index
+            completed_groups.push_back(std::move(pg));
+            pg.expected_size = 0; // Mark as dead
+            // Swap-remove from index list
+            idx_list[li] = idx_list.back();
+            idx_list.pop_back();
+            if (idx_list.empty())
+              pending_by_key.erase(pkey);
+          }
+          matched = true;
+          break;
         }
-        matched = true;
-        break;
       }
     }
 
-    // Remove completed groups from pending
-    plist.erase(
-        std::remove_if(plist.begin(), plist.end(),
-                        [](const PendingGroup &pg) { return pg.expected_size == 0; }),
-        plist.end());
-
     if (!matched) {
       // Create new group
-      PendingGroup pg;
+      size_t new_idx = all_pending.size();
+      all_pending.emplace_back();
+      PendingGroup &pg = all_pending.back();
       pg.type = etype;
       pg.root = root;
-      pg.comm_set_key = cs_key;
-      pg.expected_size = expected;
+      pg.comm_set_key = cached.sorted_cs;
+      pg.cs_hash = cached.hash;
+      pg.expected_size = cached.sorted_cs.size();
       pg.member_indices.push_back(ev_idx);
       // Build needed_pids from comm_set, excluding this pid
-      for (auto member_pid : cs_key) {
+      for (auto member_pid : cached.sorted_cs) {
         if ((id_t)member_pid != pid) {
           pg.needed_pids.insert((id_t)member_pid);
         }
@@ -130,18 +176,17 @@ void buildCollectiveGroups(const TraceDataSoA &data,
       if (pg.needed_pids.empty()) {
         // Single-member group (shouldn't happen for real collectives)
         completed_groups.push_back(std::move(pg));
+        pg.expected_size = 0;
       } else {
-        plist.push_back(std::move(pg));
+        pending_by_key[pkey].push_back(new_idx);
       }
     }
   }
 
   // Also include incomplete groups with at least 2 members
-  for (auto &[type_key, plist] : pending_by_type) {
-    for (auto &pg : plist) {
-      if (pg.member_indices.size() >= 2) {
-        completed_groups.push_back(std::move(pg));
-      }
+  for (auto &pg : all_pending) {
+    if (pg.expected_size > 0 && pg.member_indices.size() >= 2) {
+      completed_groups.push_back(std::move(pg));
     }
   }
 

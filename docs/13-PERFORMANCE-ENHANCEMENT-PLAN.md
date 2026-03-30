@@ -55,6 +55,7 @@ Current: 16 reader ranks. Measured speedup scales to ~32 ranks (44× over serial
 Each MPI rank currently reads its assigned locations sequentially. Using pthreads or OpenMP, each rank could read multiple locations concurrently. OTF2's thread-safe per-location reader API supports this.
 
 **Implementation sketch**:
+
 ```
 For each rank:
   Pass 1: Spawn T threads, each handles N/T locations → count events
