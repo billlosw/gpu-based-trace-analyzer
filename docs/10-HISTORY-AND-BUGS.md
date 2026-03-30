@@ -16,6 +16,13 @@ This document chronicles the key bugs encountered and fixed during development, 
 | 2026-03-16 | Added timestamp mode selector (SCALASCA / TILETRACE via CMake) |
 | 2026-03-17 | Fixed late_receiver: independent check + correct Scalasca timestamps → 8/8 exact match |
 | 2026-03-26 | Fixed Irecv enter timestamp per-request_id tracking; performance comparison on large traces |
+| 2026-03-29 | CLC timestamp correction v4 (blocking-only neutralization) |
+| 2026-03-29 | MPI shared memory window optimization (1.6-2.6x analysis speedup) |
+| 2026-03-29 | Direct-to-SHM reading (50% memory reduction) |
+| 2026-03-29 | GPUMemoryPool + async stream (eliminates per-batch cudaMalloc) |
+| 2026-03-29 | Statistics: `std::sort` → `std::nth_element` (4-5x faster) |
+| 2026-03-29 | P2PMatching.cu → .cpp rename (4.5x faster: no CUDA runtime init) |
+| 2026-03-29 | GPU sort investigation for P2P matching (rejected: multi-process OOM) |
 
 ## Bug 1: Silent CUDA Kernel Failure (CUDA Version Mismatch)
 
@@ -146,3 +153,51 @@ GPU Analyzer: mpi_send_event=1003  vs Enter(MPI_Recv)=1002 → late_sender (fals
 **Fix**: Changed `m_irecv_enter_ts` from `unordered_map<id_t, timestamp_t>` (per-PID) to `unordered_map<uint64_t, timestamp_t>` (per-request_id). Look up by `event.request_id()` in both `mpi_ireceive_request` and `mpi_ireceive_complete`, with erase-after-use.
 
 **Result**: Counts changed (CG 1024: 8,985,237 → 11,115,347). The increase is expected: correct earlier timestamps change which events satisfy the late_receiver condition. The remaining discrepancy with Scalasca is a separate algorithmic issue (see PROBLEMS.md TODO 19).
+
+## Optimization 1: MPI Shared Memory Window (2026-03-29)
+
+**Problem**: The Architecture C `streamBatchAnalysis()` spent 91-94% of GPU phase time on sequential MPI Send/Recv data transfer to rank 0 (13s for n1024, 38s for n2048), even though all ranks ran on the same node.
+
+**Solution**: Replaced MPI Send/Recv with `MPI_Win_allocate_shared`. All ranks write data directly into a contiguous shared memory window. After `MPI_Win_fence`, rank 0 reads the data directly — no transfer needed.
+
+**Results**: Analysis phase 14.7s → 9.3s (n1024, 1.58x), 40.5s → 15.7s (n2048, 2.58x).
+
+## Optimization 2: Direct-to-SHM Reading (2026-03-29)
+
+**Problem**: The original flow had double memory: local TraceDataSoA (calloc'd) + shared memory window (memcpy'd). For n1024: 16 GB + 16 GB = 32 GB peak.
+
+**Solution**: Split-phase reader API. `readOTF2TracePhase1()` returns event count without allocating SoA. Shared window is allocated, then `readerFillSoA()` writes vectors directly into the window. Eliminates the intermediate calloc'd SoA entirely.
+
+**Results**: Peak memory halved (32 GB → 16 GB for n1024, 64 GB → 32 GB for n2048). Wall time similar (page faults during first-touch write replace the zeroing + memcpy cost).
+
+## Optimization 3: GPUMemoryPool + Async Stream (2026-03-29)
+
+**Problem**: Per-batch `cudaMalloc`/`cudaFree` (26 pairs) cost ~0.5-1s per batch.
+
+**Solution**: `GPUMemoryPool` pre-allocates all device arrays once, reused across batches. `runAnalysisKernelsAsync()` uses `cudaMemcpyAsync` with a `cudaStream_t`.
+
+**Results**: GPU batches 1,328ms → 1,158ms (n1024), pool alloc = 2.2ms one-time.
+
+## Optimization 4: Statistics nth_element (2026-03-29)
+
+**Problem**: `std::sort` on 45M doubles for quartile computation took 6.7s (n1024).
+
+**Solution**: Replaced `std::sort` with `std::nth_element` — O(n) average for each quantile. Also merged 3 data passes into 2.
+
+**Results**: Statistics 6.7s → 1.5s (n1024, 4.3x), 13.1s → 3.0s (n2048, 5.1x).
+
+## Optimization 5: P2PMatching.cu → .cpp (2026-03-29)
+
+**Problem**: nvcc compilation of P2PMatching.cu caused CUDA runtime initialization even though no GPU code ran.
+
+**Solution**: Renamed to `.cpp`, removed unnecessary `#include "common/cuda_check.h"`.
+
+**Results**: P2P matching 2,799ms → 617ms (4.5x faster for n1024). Pure C++ avoids CUDA runtime init overhead.
+
+## CLC Timestamp Correction v4 (2026-03-29)
+
+**Design**: Blocking-only neutralization. For each recv with clock violation (`send_leave > recv_enter`):
+- If MPI_Recv (blocking): set `end_timestamps[i] = send_leave` to neutralize false late_receiver
+- If MPI_Irecv (non-blocking): leave unchanged (genuine late_receiver)
+
+**Results**: EXACT match on 16q/32q/128q LAMMPS traces, <0.5% on 64q, +0.69% on n1024 late_receiver. Supersedes v1-v3 and v8 cascade approaches.

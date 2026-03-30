@@ -5,7 +5,13 @@
 
 ## Overview
 
-The OTF2 reader uses a **distributed two-pass** strategy inspired by TileTrace. Each MPI rank reads a contiguous block of locations plus their communication partners, performs local P2P matching and collective grouping, and runs GPU analysis independently. Only final result vectors are gathered to rank 0.
+The OTF2 reader uses a **distributed two-pass** strategy inspired by TileTrace. Each MPI rank reads a contiguous block of locations plus their communication partners. The reader exposes a **split-phase API** that separates reading from storage:
+
+1. `readOTF2TracePhase1()` — Runs pass1 + pass2 + collective redistribution, returns event count + communicator sets + opaque handle
+2. `readerFillSoA(handle, data)` — Copies internal vectors into any pre-set SoA target (local calloc or shared memory window)
+3. `readerRelease(handle)` — Frees the opaque handle (deleting Pass2DataCallback and its vectors)
+
+This split allows the caller to choose where data is stored. In the shared-memory path, the SoA points into an `MPI_Win_allocate_shared` window, eliminating a 16-32 GB intermediate copy.
 
 ## otf2xx Callback System
 

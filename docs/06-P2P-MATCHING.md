@@ -1,6 +1,6 @@
 # P2P Send-Recv Matching
 
-**Source**: `src/matching/P2PMatching.cu`
+**Source**: `src/matching/P2PMatching.cpp`
 **Header**: `include/matching/P2PMatching.h`
 
 ## Overview
@@ -96,13 +96,15 @@ void runP2PMatching(TraceDataSoA &data) {
 
 ## Why This Runs on CPU, Not GPU
 
-The original implementation attempted GPU-based matching with an open-addressing hash table using `atomicCAS`/`atomicExch`. This failed because:
+P2P matching uses pure C++ (`.cpp` file, no CUDA dependency). Three attempts at GPU matching were investigated and rejected:
 
-1. **Temporal ordering**: GPU threads run in arbitrary order, so the same `(src, dst, tag)` key could match sends and receives from different iterations
-2. **Probing chain breaks**: With concurrent GPU insertion, linear probing chains could have gaps, causing lookups to stop prematurely
-3. **Race conditions**: Multiple threads could attempt to claim the same match simultaneously
+1. **GPU hash table** (initial, 2026-03-13): Open-addressing with `atomicCAS`/`atomicExch`. Failed due to temporal ordering requirement (same key appears multiple times across iterations), probing chain breaks, and race conditions.
 
-The CPU queue-based approach is correct by construction and runs in O(N log N) time (dominated by sorting). For 2.5M events, matching takes ~255 ms — only 1% of total execution time, since OTF2 reading dominates at 98%.
+2. **GPU sort-based** (`thrust::sort_by_key`, 2026-03-29): Failed because 64 MPI ranks sharing one GPU cannot all use thrust simultaneously — causes cudaErrorMemoryAllocation (OOM) and cudaErrorInvalidValue. Each rank would need ~48 MB GPU memory for sort workspace; 64 ranks × 48 MB = 3 GB concurrent + radix sort temp space exceeds GPU memory.
+
+3. **nvcc overhead discovery** (2026-03-29): Even without any GPU code, compiling P2PMatching as `.cu` (processed by nvcc) caused CUDA runtime initialization overhead. Renaming to `.cpp` improved P2P matching from 2,799ms to 617ms — **4.5x faster** — purely by avoiding CUDA runtime init.
+
+The CPU queue-based approach is correct by construction and runs in O(N log N) time (dominated by sorting). For 4M events per rank, matching takes ~617 ms.
 
 ## Performance Characteristics
 

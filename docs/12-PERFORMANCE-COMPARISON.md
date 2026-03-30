@@ -54,20 +54,44 @@ We compare **analysis time only**, excluding trace reading/I/O:
 
 ### GPU Analyzer Timing Breakdown
 
-| Trace | P2P Match | Coll. Group | Batch Analysis | Statistics | Total |
-|-------|----------|------------|---------------|-----------|-------|
-| LAMMPS 16 | 32ms | 2ms | 588ms | 128ms | 0.75s |
-| LAMMPS 32 | 57ms | 5ms | 707ms | 265ms | 1.03s |
-| LAMMPS 128 | 245ms | 45ms | 2,021ms | 1,160ms | 3.47s |
-| LAMMPS 512 | 1,001ms | 533ms | 6,714ms | 3,958ms | 12.21s |
-| CG 1024 | 2,647ms | 3,801ms | 15,456ms | 7,265ms | 29.17s |
-| CG 2048 | 4,544ms | 13,107ms | 38,256ms | 10,392ms | 66.30s |
+**Latest results (SHM + GPUMemoryPool + nth_element, 2026-03-29):**
 
-Dominant phases scale differently:
-- **Batch Analysis (GPU kernels)**: Primary GPU workload, scales with #events × matched-pairs
-- **Statistics (CPU)**: Sorting-based, O(N log N), becomes significant for large traces
-- **P2P Matching (CPU)**: FIFO-queue matching, scales with #events
-- **Collective Grouping (CPU)**: Depends on communicator sizes, dominant for large CG traces
+| Trace | OTF2 Read | Preprocess (CPU) | GPU Analysis | Cleanup | Statistics | Total |
+|-------|----------|-----------------|-------------|---------|-----------|-------|
+| LAMMPS 1024 | 31,403ms | 10,600ms | 1,237ms | 2,476ms | 1,533ms | 47,249ms |
+| LAMMPS 2048 | 213,743ms | 23,916ms | 6,061ms | 3,834ms | 2,999ms | 250,554ms |
+
+SHM Preprocess sub-phases (LAMMPS n1024):
+| Sub-phase | Time (ms) | % of Preprocess |
+|-----------|-----------|-----------------|
+| fill_soa (page faults + copy) | 5,061 | 48% |
+| coll_grouping | 2,875 | 27% |
+| pinning (cudaHostRegister) | 1,990 | 19% |
+| p2p_matching | 617 | 6% |
+| ts_correction + misc | 57 | <1% |
+
+GPU breakdown (LAMMPS n1024):
+| Sub-phase | Time (ms) |
+|-----------|-----------|
+| batch_prep (match_partner remap + CSR) | 523 |
+| H2D transfer (pinned DMA) | 447 |
+| Kernels (P2P=9 + Coll=88) | 97 |
+| D2H + other | 170 |
+| **Total GPU batches** | **1,237** |
+
+**Previous results (pre-optimization, Architecture C MPI Send/Recv):**
+
+| Trace | P2P Match | Coll. Group | Batch Analysis | Statistics | Total Analysis |
+|-------|----------|------------|---------------|-----------|---------------|
+| LAMMPS 1024 | 624ms | 3,004ms | 14,660ms | 6,779ms | 25,067ms |
+| LAMMPS 2048 | 1,069ms | 10,124ms | 40,541ms | 9,981ms | 61,715ms |
+
+**Optimization impact:**
+
+| Trace | Before (Analysis+Stats) | After (Preprocess+GPU+Cleanup+Stats) | Speedup |
+|-------|------------------------|--------------------------------------|---------|
+| n1024 | 25,067ms | 15,846ms | **1.58x** |
+| n2048 | 61,715ms | 36,810ms | **1.68x** |
 
 ### Scalasca Timing Breakdown
 
@@ -154,6 +178,8 @@ OTF2 reading is the GPU analyzer's primary bottleneck (79-97% of total). Scalasc
 
 ## Summary
 
-The GPU analyzer achieves **12-131× speedup** in analysis time for moderate-scale traces (16-512 processes) on a single GPU compared to Scalasca on multi-core CPU. For large-scale traces (1024+ processes), Scalasca's massive CPU parallelism gives it an advantage. The GPU analyzer's throughput of ~5-11M events/s on a single device is competitive with hundreds of CPU cores.
+The GPU analyzer achieves **12-131x speedup** in analysis time for moderate-scale traces (16-512 processes) on a single GPU compared to Scalasca on multi-core CPU. For large-scale traces (1024+ processes), Scalasca's massive CPU parallelism gives it an advantage. The GPU analyzer's throughput of ~5-11M events/s on a single device is competitive with hundreds of CPU cores.
 
-The main limitation is OTF2 reading speed—dominated by sequential I/O through the OTF2 library with only 16 reader ranks—which accounts for the majority of end-to-end latency. Correctness is verified with exact matches on 7 of 8 implemented metrics (plus `late_sender` <1% for timestamp-corrected traces). The `late_receiver` discrepancy (~13-44%) is a known systematic algorithmic difference under investigation.
+Optimizations from 2026-03-29 (MPI shared memory, GPUMemoryPool, nth_element statistics, .cu→.cpp rename) reduced the analysis+statistics phase by 1.6-1.7x. The actual GPU kernel time is now only ~97ms for n1024 (262M events) — the remaining overhead is host-side preprocessing, memory management, and I/O.
+
+The main limitation is OTF2 reading speed — dominated by sequential I/O through the OTF2 library with 64 reader ranks — which accounts for 67-85% of end-to-end latency. Correctness is verified with exact matches on 7 of 8 implemented metrics. The `late_receiver` discrepancy (~13-44%) is a known systematic difference (see PROBLEMS.md TODO 19).

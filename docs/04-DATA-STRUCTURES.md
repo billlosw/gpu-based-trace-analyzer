@@ -31,6 +31,7 @@ When a CUDA warp (32 threads) reads `timestamps[threadIdx]`, all 32 reads fall w
 struct TraceDataSoA {
     size_t count;       // Number of events currently stored
     size_t capacity;    // Allocated capacity
+    bool owns_memory;   // If true, deallocate() calls free(); if false, only nullifies pointers
 
     // === 12 base arrays (one element per event) ===
     event_t    *events;          // MPI event type (TT_MPI_Send, TT_MPI_Barrier, etc.)
@@ -93,7 +94,11 @@ void allocate(size_t n) {
 
 ### Ownership
 
-`TraceDataSoA` owns all its arrays (allocated with `calloc`, freed with `free`). It is move-only (deleted copy constructor/assignment). The destructor calls `deallocate()` which frees all arrays.
+`TraceDataSoA` has an `owns_memory` flag (default `true`):
+- When `owns_memory == true`: `allocate()` uses `calloc`, `deallocate()` calls `free` on all arrays. This is the standard path for single-rank mode.
+- When `owns_memory == false`: `deallocate()` only nullifies pointers without calling `free()`. This is used when the SoA points into an MPI shared memory window (`MPI_Win_allocate_shared`), where the window manages the memory lifecycle.
+
+The struct is move-only (deleted copy constructor/assignment). The destructor calls `deallocate()` which respects the `owns_memory` flag.
 
 ## CollectiveGroupCSR — GPU-Friendly Group Format
 
@@ -138,18 +143,19 @@ for (int j = offsets[g]; j < offsets[g+1]; j++) {
 - **Simple indexing**: One `offsets` lookup per group, then linear scan
 - **Standard format**: Well-understood in GPU computing (same as sparse matrix CSR)
 
-## ReaderOutput — Reader Return Type
+## ReaderPhase1Output — Split-Phase Reader Return Type
 
 **Location**: `include/reader/OTF2SoAReader.h`
 
 ```cpp
-struct ReaderOutput {
-    TraceDataSoA data;                         // All events in SoA format
+struct ReaderPhase1Output {
+    size_t event_count;                         // Number of events this rank will store
     std::vector<std::vector<uint64_t>> comm_sets;  // Communicator member lists
+    void *handle;                               // Opaque pointer to Pass2DataCallback
 };
 ```
 
-`comm_sets[i]` contains the member process IDs of the communicator used by the `i`-th collective event (in the order they appear in the event stream). This is used by `CollectiveGrouping` to determine which processes should participate in each group.
+The split-phase API separates reading from storage: `readOTF2TracePhase1()` returns event count and comm_sets without allocating the SoA, allowing the caller to choose the target memory (local calloc or shared window). Then `readerFillSoA(handle, data)` copies internal vectors into the pre-set SoA, and `readerRelease(handle)` frees the reader's internal state.
 
 ## RawAnalysisOutput — Kernel Results
 
@@ -169,11 +175,48 @@ struct RawAnalysisOutput {
     float h2d_ms;         // Host-to-device transfer time
     float p2p_kernel_ms;  // P2P analysis kernel time
     float coll_kernel_ms; // Collective analysis kernel time
-    float d2h_ms;         // Device-to-host transfer time (currently unused/0)
+    float d2h_ms;         // Device-to-host transfer time
+    float gpu_alloc_ms;   // cudaMalloc time (0 when using GPUMemoryPool)
+    float gpu_free_ms;    // cudaFree time (placeholder)
+    float pin_ms;         // cudaHostRegister time per batch
+    float unpin_ms;       // cudaHostUnregister time per batch
+    float batch_prep_ms;  // match_partner remap + CSR batch construction time
 };
 ```
 
 Each vector contains the raw duration values in picoseconds. These are later converted to seconds by `computeStatistics` (dividing by 1e12).
+
+## GPUMemoryPool — Pre-Allocated Device Memory
+
+**Location**: `include/analysis/AnalysisKernels.h`
+
+```cpp
+struct GPUMemoryPool {
+    // Trace input arrays (6)
+    event_t *d_events; timestamp_t *d_timestamps, *d_end_timestamps;
+    int32_t *d_match; id_t *d_pids, *d_roots;
+
+    // P2P output (4)
+    double *d_ls_out, *d_lr_out;
+    unsigned int *d_ls_cnt, *d_lr_cnt;
+
+    // Collective input (4)
+    int32_t *d_coll_offsets, *d_coll_members;
+    event_t *d_group_types; id_t *d_group_roots;
+
+    // Collective output (12)
+    double *d_bw_out, *d_bc_out, *d_er_out, *d_lb_out, *d_wn_out, *d_nc_out;
+    unsigned int *d_bw_cnt, *d_bc_cnt, *d_er_cnt, *d_lb_cnt, *d_wn_cnt, *d_nc_cnt;
+
+    // Capacities
+    size_t max_events, max_coll_members, max_coll_groups;
+
+    void allocate(size_t max_n, size_t max_members, size_t max_groups);
+    void deallocate();
+};
+```
+
+The pool allocates all 26 device pointers once at the start of batched GPU analysis, reused across all K-rank batches. This eliminates per-batch `cudaMalloc`/`cudaFree` overhead (~170ms savings). For LAMMPS n1024, pool allocation takes ~2.2 ms and uses ~12 GB device memory.
 
 ## AnalysisResult — Statistics Output
 

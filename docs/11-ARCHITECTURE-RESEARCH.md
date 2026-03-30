@@ -78,7 +78,7 @@ For TB-scale traces (1B+ events): the gather approach completely breaks — 64+ 
 
 ## 3. Architecture Options
 
-### Architecture A: Gather-All-to-Rank-0 (Current Implementation)
+### Architecture A: Gather-All-to-Rank-0 (Superseded — was initial implementation)
 
 ```
 ALL RANKS (P processes)         RANK 0 ONLY
@@ -188,7 +188,7 @@ Compare to Architecture A single launch on 500M events: H2D = 640ms + kernel = 2
 
 ---
 
-### Architecture C: Adaptive Batch Streaming (Extension of B)
+### Architecture C: Adaptive Batch Streaming (Extension of B) — **IMPLEMENTED (Current)**
 
 Instead of processing one rank's data at a time, process K ranks' data in one GPU launch:
 

@@ -90,10 +90,12 @@ srun --mpi=pmix -n 8 --gres=gpu:4090:1 ./build/gpu_analyzer /path/to/traces.otf2
 ### Command-Line Arguments
 
 ```
-Usage: gpu_analyzer <path/to/traces.otf2>
+Usage: gpu_analyzer <path/to/traces.otf2> [--time-correct]
 ```
 
-Only one argument: the path to the OTF2 anchor file (`.otf2`).
+Two arguments:
+1. The path to the OTF2 anchor file (`.otf2`) — required
+2. `--time-correct` — optional flag to enable CLC timestamp correction for blocking recv events
 
 ### SLURM Configuration on FUSE
 
@@ -178,12 +180,13 @@ Plus a timing summary:
 
 ```
 === Timing Summary ===
-OTF2 Read:            25146.23 ms
-P2P Matching:         255.12 ms
-Coll. Grouping (CPU): 1.80 ms
-Analysis (GPU):       125.45 ms
-Statistics (CPU):     120.33 ms
-Total:                25648.93 ms
+OTF2 Read:            31403.00 ms
+Preprocess (CPU):     10600.10 ms
+GPU Analysis:         1236.64 ms
+Cleanup:              2475.76 ms
+Analysis (total):     14312.75 ms
+Statistics:           1533.28 ms
+Total:                47249.31 ms
 ```
 
 ## Troubleshooting

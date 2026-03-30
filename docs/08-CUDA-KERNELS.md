@@ -5,7 +5,10 @@
 
 ## Overview
 
-5 CUDA kernels implement 8 wait-state analyses. The host function `runAnalysisKernels()` orchestrates GPU memory management, transfers, kernel launches, and result retrieval.
+5 CUDA kernels implement 8 wait-state analyses. Two host functions orchestrate GPU memory management, transfers, kernel launches, and result retrieval:
+
+- `runAnalysisKernels()` — Synchronous variant. Allocates/frees device memory per call. Used by single-rank path and multi-node fallback.
+- `runAnalysisKernelsAsync()` — Uses pre-allocated `GPUMemoryPool` and `cudaStream_t` with `cudaMemcpyAsync`. Used by the shared-memory batched GPU path. Eliminates per-batch allocation overhead.
 
 ## Kernel Designs
 
@@ -144,7 +147,15 @@ Identical logic to `kernelBarrierWaitCompletion` but filters for N-to-N collecti
 - `MPI_All_Gather`, `MPI_All_Gatherv`
 - `MPI_All_Reduce`, `MPI_AlltoAll`
 
-## Host Function: `runAnalysisKernels()`
+## Host Functions
+
+### `runAnalysisKernels()` — Synchronous Variant
+
+Allocates all device memory via `cudaMalloc`, copies data H2D synchronously, launches all 5 kernels, copies results D2H, and frees device memory. Used for single-rank and multi-node fallback paths.
+
+### `runAnalysisKernelsAsync()` — Pool + Stream Variant
+
+Uses a pre-allocated `GPUMemoryPool` (see [04-DATA-STRUCTURES.md](./04-DATA-STRUCTURES.md)) and a `cudaStream_t` for asynchronous operations. All `cudaMemcpyAsync` calls and kernel launches are ordered on the stream. Sets `gpu_alloc_ms = 0` since the pool is pre-allocated.
 
 ### GPU Memory Allocation Strategy
 
@@ -203,15 +214,17 @@ cudaEventElapsedTime(&output.h2d_ms, ev_start, ev_h2d_done);
 cudaEventElapsedTime(&output.p2p_kernel_ms, ev_h2d_done, ev_p2p_done);
 ```
 
-### Performance Profile (CG-C, 2.5M events, RTX 5090)
+### Performance Profile (LAMMPS n1024, 262M events, RTX 4090, SHM + GPUMemoryPool)
 
 | Sub-phase | Time | Notes |
 |-----------|------|-------|
-| H2D transfer | ~20 ms | 32 bytes/event * 2.5M = ~80 MB |
-| P2P kernel | ~50 ms | 256 blocks * 256 threads |
-| Collective kernels | ~55 ms | 63 groups * 1 thread each |
-| D2H transfer | ~3 ms | Only actual results |
-| **Total** | ~125 ms | |
+| Pool allocation | ~2.2 ms | One-time, eliminates per-batch cudaMalloc/cudaFree |
+| Batch prep (match_partner remap + CSR) | ~523 ms | CPU work before GPU |
+| H2D transfer | ~447 ms | 32 bytes/event, pinned DMA |
+| P2P kernel | ~9 ms | Grid-stride, 256 blocks × 256 threads |
+| Collective kernels | ~88 ms | 186 groups × 1 thread each |
+| D2H transfer | ~1 ms | Only actual results |
+| **GPU total (batches)** | **~1,237 ms** | Including prep + pin overhead |
 
 ## Memory Access Patterns
 

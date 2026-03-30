@@ -27,28 +27,34 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
                           |  (.otf2 + traces/)    |
                           +-----------+-----------+
                                       |
-                    Step 1: MPI-Parallel Two-Pass Reading
-                    (N ranks, contiguous location blocks)
+                    Step 1: MPI-Parallel Two-Pass Reading (split-phase API)
+                    readOTF2TracePhase1() → event count + opaque handle
                                       |
             +-------------------------+-------------------------+
-            |                                                   |
-   Step 2: P2P Matching (CPU, local)           Step 3: Collective Grouping (CPU, local)
-   timestamp-sorted FIFO queues                comm_set-based, produces CSR
-            |                                                   |
-            +-------------------------+-------------------------+
+            |                         |                         |
+   Step 2: Shared Memory Window   readerFillSoA()    (or local alloc for single-rank)
+   MPI_Win_allocate_shared        → fill SoA into SHM
+            |                         |
+   Step 3: P2P Matching (CPU, local)  Step 4: Collective Grouping (CPU, local)
+   timestamp-sorted FIFO queues       comm_set-based, produces CSR
+            |                         |
+   Step 3.5: Timestamp Correction (optional, --time-correct)
+   CLC blocking-only neutralization
+            |
+            +-------------------------+
                                       |
-                    Step 4: Adaptive Batch Streaming (Architecture C)
-                    Rank 0 computes K = min(P, VRAM_budget / per_rank_data)
+                    Step 5: Adaptive Batch Streaming (single GPU, rank 0)
+                    GPUMemoryPool pre-allocated, CUDA stream
+                    K = min(P, VRAM_budget / per_rank_data)
                     For each batch of K ranks:
-                      - MPI point-to-point recv K ranks' SoA + CSR
-                      - Merge with index remapping (if K > 1)
-                      - H2D → 5 CUDA Kernels → D2H on single GPU
+                      - Remap match_partner, build batch CSR
+                      - H2D (pinned DMA) → 5 CUDA Kernels → D2H
                       - Accumulate results
                     Memory: O(K*N/P), not O(N)
                                       |
                           +-----------v-----------+
                           | CPU Statistics        |
-                          | (sort, quartiles)     |
+                          | (nth_element, O(n))   |
                           +-----------+-----------+
                                       |
                           +-----------v-----------+
@@ -62,12 +68,15 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Data layout | **SoA** (Structure of Arrays) | GPU coalesced memory access; warps read contiguous addresses |
-| Trace reading | **MPI-parallel two-pass**, otf2xx | Dominated by I/O; parallelizing across ranks gives near-linear speedup |
-| P2P matching | **CPU**, timestamp-sorted FIFO per rank | Requires temporal ordering; done locally on each rank in parallel |
+| Trace reading | **MPI-parallel two-pass**, split-phase API | Dominated by I/O; parallelizing across ranks gives near-linear speedup; split-phase enables direct-to-SHM writing |
+| P2P matching | **CPU** (pure `.cpp`), timestamp-sorted FIFO per rank | Requires temporal ordering; done locally on each rank in parallel; `.cu` caused 4.5x overhead from CUDA runtime init |
 | Collective grouping | **CPU**, comm_set-based CSR per rank | Variable-length groups; small fraction of total events; produces GPU-friendly CSR |
-| GPU analysis | **Adaptive batch streaming on rank 0** | K ranks' data per GPU batch; K computed from VRAM; O(K*N/P) memory |
+| Data sharing | **MPI shared memory window** (same-node primary) | Zero-copy: all ranks write into shared buffer; eliminates 16+ GB MPI Send/Recv; 50% memory savings vs double-buffer |
+| GPU analysis | **Adaptive batch streaming on rank 0** | K ranks' data per GPU batch; K computed from VRAM; O(K*N/P) memory; GPUMemoryPool eliminates per-batch alloc |
 | Analysis kernels | **GPU CUDA kernels** | Massively parallel event processing; one thread/event for P2P, one block/group for collectives |
 | Event linking | **Index-based** (int32_t) | GPU-compatible; no pointers across host/device |
+| Statistics | **`std::nth_element`** (O(n) average) | 4-5x faster than `std::sort` for quartile computation |
+| Timestamp correction | **Blocking-only CLC neutralization** | Only neutralizes blocking MPI_Recv violations; non-blocking MPI_Irecv left unchanged (genuine late_receiver) |
 
 ## Comparison with TileTrace
 
@@ -103,4 +112,5 @@ Validated on CG Class B and CG Class C traces (64 locations). See [09-TESTING.md
 | [10-HISTORY-AND-BUGS.md](./10-HISTORY-AND-BUGS.md) | Development history, bugs found and fixed |
 | [11-ARCHITECTURE-RESEARCH.md](./11-ARCHITECTURE-RESEARCH.md) | Architecture exploration and research notes |
 | [12-PERFORMANCE-COMPARISON.md](./12-PERFORMANCE-COMPARISON.md) | Performance comparison: GPU Analyzer vs Scalasca |
+| [13-PERFORMANCE-ENHANCEMENT-PLAN.md](./13-PERFORMANCE-ENHANCEMENT-PLAN.md) | Prioritized performance optimization roadmap |
 | [PROBLEMS.md](./PROBLEMS.md) | Known issues, potential bugs, TODOs |

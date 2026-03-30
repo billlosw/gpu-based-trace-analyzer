@@ -16,7 +16,7 @@
 
 ### TODO 2: P2P Key Bit Packing Overflow Risk
 
-**File**: `src/matching/P2PMatching.cu`, line 37-39
+**File**: `src/matching/P2PMatching.cpp`, line 37-39
 
 ```cpp
 auto makeKey = [](id_t a, id_t b, id_t c) -> uint64_t {
@@ -78,17 +78,17 @@ for (size_t i = 0; i < n; i++) {
 
 ## Performance Issues
 
-### TODO 5: No Chunked Processing for Large Traces
+### ~~TODO 5: No Chunked Processing for Large Traces~~ [ADDRESSED 2026-03-29]
 
-**File**: `src/analysis/AnalysisKernels.cu`, `runAnalysisKernels()`
+**File**: `src/analysis/AnalysisKernels.cu`, `runAnalysisKernelsAsync()`
 
-**Issue**: The entire trace is allocated on GPU in one shot. With 24GB VRAM on RTX 4090 and ~60 bytes per event (full SoA) or ~32 bytes (GPU-transferred subset), the maximum is ~400M-750M events. CG Class D has ~40M events, which fits easily, but very large traces (e.g., LAMMPS with millions of timesteps) could exceed GPU memory.
+**Issue**: Previously, the entire trace was allocated on GPU in one shot. With 24GB VRAM on RTX 4090, this limited processable trace size.
 
-**Current behavior**: `cudaMalloc` will fail and `CUDA_CHECK` will `exit(EXIT_FAILURE)`.
+**Solution**: Architecture C adaptive batch streaming is now implemented in `sharedMemoryDirectAnalysis()`. The system computes `K = min(P, VRAM_budget / per_rank_data)` ranks per GPU batch. `GPUMemoryPool` pre-allocates device memory once, and each batch processes K ranks' data with H2D → kernels → D2H. Memory usage is O(K×N/P), not O(N). This was validated on traces up to n2048 (524M events).
 
-**Possible fix**: Implement chunked processing: split events into GPU-sized chunks, process each chunk, and merge results on CPU. P2P matching (which needs global access to paired events) is the main challenge for chunking.
+**Remaining concern**: Very large per-rank event counts could still exceed per-batch VRAM budget. The adaptive K computation handles this, but has not been tested at extreme scale.
 
-**Priority**: Low (no traces have exceeded GPU memory yet).
+**Priority**: Low (the adaptive batching mechanism is in place).
 
 ---
 
@@ -130,37 +130,33 @@ CUDA_CHECK(cudaMalloc(&d_lr_out, n * sizeof(double)));
 
 ---
 
-### TODO 8: Statistics Sort on CPU Is Sequential
+### ~~TODO 8: Statistics Sort on CPU Is Sequential~~ [ADDRESSED 2026-03-29]
 
-**File**: `src/analysis/Statistics.cpp`, line 37-43
+**File**: `src/analysis/Statistics.cpp`
 
-```cpp
-std::vector<double> sorted(durations.size());
-// copy and divide by scaling factor
-std::sort(sorted.begin(), sorted.end());
-```
+**Issue**: Previously used `std::sort` (O(N log N)) for quartile computation, taking ~6.7s for n1024.
 
-**Issue**: Sorting happens on CPU, which is O(N log N). For very large traces with millions of results, this could take significant time.
+**Solution**: Replaced with `std::nth_element` (O(N) average) for each quantile point (median, Q25, Q75). Also merged 3 data passes into 2. Results: 6.7s → 1.5s (n1024, 4.3×), 13.1s → 3.0s (n2048, 5.1×).
 
-**Impact**: For CG traces (~300K-1M results per analysis), sorting takes ~50-100ms per analysis. Total statistics phase is ~120ms.
+**Remaining opportunity**: GPU-accelerated radix sort (CUB/Thrust) could further reduce statistics time, especially for very large traces. See performance enhancement plan.
 
-**Possible fix**: Use CUB or Thrust radix sort on GPU before copying back. Or only compute approximate quartiles using GPU-based selection algorithms.
-
-**Priority**: Low.
+**Priority**: Low (nth_element is already 4-5× faster).
 
 ---
 
 ## Code Quality Issues
 
-### TODO 9: P2PMatching.cu Is Not Actually GPU Code
+### ~~TODO 9: P2PMatching.cu Is Not Actually GPU Code~~ [FIXED 2026-03-29]
 
-**File**: `src/matching/P2PMatching.cu`
+**File**: `src/matching/P2PMatching.cpp` (renamed from `.cu`)
 
-**Issue**: Despite the `.cu` extension, this file contains pure CPU code (STL containers, no CUDA kernels). The `.cu` extension was kept for CUDA linker compatibility, but it's confusing for developers.
+**Issue**: The `.cu` extension caused nvcc to compile the file, triggering CUDA runtime initialization even though it contained pure CPU code. This added 4.5× overhead (2,799ms → 617ms after rename).
 
-**Possible fix**: Rename to `.cpp` and adjust CMakeLists.txt. The CUDA separable compilation should still work if the `.cpp` file doesn't contain device code. Alternatively, add a comment at the top of the file explaining why it's `.cu`.
+**Solution**: Renamed to `.cpp` and updated `CMakeLists.txt`. No code changes needed.
 
-**Priority**: Low (cosmetic).
+**Note**: The old `P2PMatching.cu` file still exists on disk as stale dead code. It should be deleted (see TODO 24).
+
+**Priority**: Fixed.
 
 ---
 
@@ -177,17 +173,11 @@ std::sort(sorted.begin(), sorted.end());
 
 ---
 
-### TODO 11: `const_cast` in `gatherEventsToRank0`
+### ~~TODO 11: `const_cast` in `gatherEventsToRank0`~~ [OBSOLETE 2026-03-29]
 
-**File**: `src/reader/OTF2SoAReader.cpp`, line 377
+**Issue**: This function no longer exists. The SHM-based architecture (`sharedMemoryDirectAnalysis()`) eliminated the need for `gatherEventsToRank0` — each rank writes directly into the shared memory window, and rank 0 reads from it with zero copy. No data gathering is needed.
 
-```cpp
-auto &local_cs = const_cast<SoAReaderCallback &>(cb).getCommSets();
-```
-
-**Issue**: The function takes `const SoAReaderCallback &cb` but needs mutable access to `getCommSets()`. This is a code smell — the function should either take a non-const reference or `getCommSets()` should have a const overload.
-
-**Priority**: Low (functionally correct but poor style).
+**Priority**: N/A (code removed).
 
 ---
 
@@ -235,13 +225,15 @@ srun --mpi=pmix -n 64 scout.mpi ~/claude/TileTraceClaude/exp/traces/cg.D/traces.
 
 ---
 
-### TODO 15: No CUDA Stream Overlapping
+### ~~TODO 15: No CUDA Stream Overlapping~~ [PARTIALLY ADDRESSED 2026-03-29]
 
-**Issue**: The pipeline is strictly sequential: H2D transfer → P2P kernel → D2H → H2D (CSR) → collective kernels → D2H. Using CUDA streams, the H2D transfer and kernel execution could be overlapped, potentially hiding transfer latency.
+**Issue**: The pipeline was strictly sequential: H2D → kernels → D2H. Using CUDA streams, these could be overlapped.
 
-**Impact**: For CG traces, the H2D transfer is ~20ms and kernels are ~100ms. Overlapping could save ~20ms (16% of GPU phase). Since GPU phase is only ~0.5% of total time, the overall impact is minimal.
+**Solution**: `runAnalysisKernelsAsync()` now uses `cudaMemcpyAsync` with a `cudaStream_t`, and `GPUMemoryPool` eliminates per-batch `cudaMalloc`/`cudaFree`. The async path is used within each batch.
 
-**Priority**: Low.
+**Remaining opportunity**: Inter-batch overlapping (preparing batch K+1 on CPU while batch K runs on GPU) is not yet implemented. Since GPU kernel time is only ~97ms for n1024 vs ~523ms batch prep time, this could hide most of the kernel latency. However, the total GPU phase is only ~1.2s for n1024 — the bigger bottleneck is CPU preprocessing (10.6s) and OTF2 reading (31.4s).
+
+**Priority**: Low (GPU phase is a small fraction of total time).
 
 ---
 
@@ -364,17 +356,14 @@ The early_scan metric becomes more significant at higher rank counts (14.3s aggr
 
 ---
 
-### TODO 21: OTF2 Reading is Performance Bottleneck (84-97% of Total Time)
+### TODO 21: OTF2 Reading is Performance Bottleneck (67-85% of Total Time)
 
 **Issue**: OTF2 reading dominates total execution time across all traces:
 
 | Trace | OTF2 Read Time | % of Total | Trace Size |
 |-------|---------------|-----------|-----------|
-| LAMMPS 16 | 19.8s | 96.6% | 1.1 GB |
-| LAMMPS 128 | 62.6s | 92.6% | 3.7 GB |
-| LAMMPS 512 | 191.5s | 91.9% | 12 GB |
-| NPB CG 1024 | 171.0s | 84.5% | 9.9 GB |
-| NPB CG 2048 | 332.5s | 83.5% | 20 GB |
+| LAMMPS 1024 | 31.4s | 66.5% | ~9.9 GB |
+| LAMMPS 2048 | 213.7s | 85.3% | ~20 GB |
 
 The read throughput is approximately 55-65 MB/s, far below the NVMe SSD capability. This is due to the OTF2 library's per-location sequential reading and the 2-pass reader design (discovery + data).
 
@@ -440,3 +429,75 @@ srun -N 1 -n 64 -w fuse2 -p Long --gres=gpu:5090:1 ./build/gpu_analyzer /home/lu
 **Impact on counts**: The fix INCREASED late_receiver counts (e.g., NPB CG 1024: 8,985,237 → 11,115,347) because correct earlier timestamps change which events satisfy the `send_leave > recv_req_enter > send_enter` condition. This is correct behavior. See TODO 19 for the remaining Scalasca discrepancy.
 
 **Priority**: Fixed.
+
+---
+
+### TODO 24: Stale P2PMatching.cu File on Disk
+
+**File**: `src/matching/P2PMatching.cu`
+
+**Issue**: After the `.cu` → `.cpp` rename (TODO 9), the old `P2PMatching.cu` file was not deleted. It sits alongside the active `P2PMatching.cpp` and is not referenced by `CMakeLists.txt`. This is confusing for developers who may edit the wrong file.
+
+**Possible fix**: Delete `src/matching/P2PMatching.cu`.
+
+**Priority**: Low (cosmetic, no build impact).
+
+---
+
+### TODO 25: SHM fill_soa Page Fault Cost
+
+**File**: `src/main.cu`, `sharedMemoryDirectAnalysis()` → `readerFillSoA()`
+
+**Issue**: The `fill_soa` phase (writing OTF2 data into the shared memory window) takes 5.1s for n1024 (48% of the 10.6s preprocess phase). This cost comes from first-touch page faults on the SHM window — `MPI_Win_allocate_shared` allocates virtual memory but physical pages are only mapped on first write.
+
+**Possible mitigations**:
+1. **Explicit mmap prefaulting**: Use `MAP_POPULATE` or `madvise(MADV_WILLNEED)` on the SHM region before writing
+2. **NUMA-aware allocation**: Pin SHM pages to the local NUMA node
+3. **Parallel fill**: Use OpenMP threads within each rank to parallelize the first-touch writes
+
+**Priority**: Medium (5.1s is significant in the 15.8s analysis phase).
+
+---
+
+### TODO 26: Collective Grouping Scalability
+
+**File**: `src/matching/CollectiveGrouping.cpp`
+
+**Issue**: Collective grouping takes 2.9s for n1024 (27% of preprocess) and likely scales super-linearly for larger traces. Two algorithmic bottlenecks:
+1. **Linear scan over pending groups**: For each event, the algorithm linearly scans all pending groups of the same type and performs O(comm_size) vector equality comparison. With many concurrent collectives of different communicators, this becomes O(events × pending_groups × comm_size).
+2. **Redundant comm_set normalization**: `normalizeCommSet()` copies and sorts the communicator member vector for every collective event, even when the same communicator appears thousands of times.
+
+**Possible fixes**:
+1. Hash the sorted comm_set for O(1) amortized lookup instead of linear scan with vector comparison
+2. Cache normalized comm_sets by communicator ID to avoid redundant sorts
+3. Parallelize grouping across event types (they are independent)
+
+**Priority**: Medium (becomes bottleneck for n2048+ traces).
+
+---
+
+### TODO 27: SHM Cleanup Cost
+
+**Issue**: The cleanup phase (`cudaHostUnregister` + `MPI_Win_free`) takes 2.5s for n1024 and 3.8s for n2048. `cudaHostUnregister` is expensive because it must synchronize the CUDA context and unpin physical pages.
+
+**Possible mitigations**:
+1. **Defer cleanup**: Let `MPI_Finalize` handle window freeing (acceptable for single-use tools)
+2. **Reduce pinned region**: Only pin the subset of SHM needed for the current GPU batch, not the entire window
+3. **Adaptive pinning**: Already partially implemented — for >10GB data, per-batch pinning is used instead of full-window pinning
+
+**Priority**: Low (cleanup is not on the critical path for analysis correctness).
+
+---
+
+### TODO 28: CLC Timestamp Correction Limitations (Distributed Reading)
+
+**Issue**: The CLC v4 blocking-only neutralization achieves exact match on small LAMMPS traces (16q/32q/128q) but has <1% gap on larger traces (64q: <0.5%, n1024: +0.69% late_receiver). This comes from the distributed reading architecture: each rank only sees its local subset of events, while Scalasca's CLC operates on the full per-location timeline.
+
+Specifically, clock violations where the sender's Leave timestamp from a remote rank's timeline is needed for local correction cannot be resolved without cross-rank communication. The current design applies corrections locally per-rank, which is a practical approximation.
+
+**Possible improvements**:
+1. After P2P matching, exchange violation information across ranks via MPI
+2. Implement multi-pass correction (correct violations that create new violations)
+3. Accept the <1% gap as within acceptable tolerance
+
+**Priority**: Low (the gap is small and documented; exact CLC would require Scalasca's full multi-pass amortization algorithm).
