@@ -163,6 +163,10 @@ struct CollectiveGroupCSR {
   int32_t *members = nullptr;   // size: total members
   event_t *group_types = nullptr; // size: num_groups
   id_t *group_roots = nullptr;     // size: num_groups (root pid for each group)
+  // Per-member bytes sent/received (from OTF2 mpi_collective_end).
+  // Used by GPU kernels to filter zero-byte members (Scalasca compatibility).
+  uint64_t *member_bytes_sent = nullptr;     // size: total_members
+  uint64_t *member_bytes_received = nullptr; // size: total_members
   size_t total_members = 0;
 
   CollectiveGroupCSR() = default;
@@ -172,11 +176,15 @@ struct CollectiveGroupCSR {
   CollectiveGroupCSR(CollectiveGroupCSR &&o) noexcept
       : num_groups(o.num_groups), offsets(o.offsets), members(o.members),
         group_types(o.group_types), group_roots(o.group_roots),
+        member_bytes_sent(o.member_bytes_sent),
+        member_bytes_received(o.member_bytes_received),
         total_members(o.total_members) {
     o.offsets = nullptr;
     o.members = nullptr;
     o.group_types = nullptr;
     o.group_roots = nullptr;
+    o.member_bytes_sent = nullptr;
+    o.member_bytes_received = nullptr;
     o.num_groups = 0;
     o.total_members = 0;
   }
@@ -188,11 +196,15 @@ struct CollectiveGroupCSR {
       members = o.members;
       group_types = o.group_types;
       group_roots = o.group_roots;
+      member_bytes_sent = o.member_bytes_sent;
+      member_bytes_received = o.member_bytes_received;
       total_members = o.total_members;
       o.offsets = nullptr;
       o.members = nullptr;
       o.group_types = nullptr;
       o.group_roots = nullptr;
+      o.member_bytes_sent = nullptr;
+      o.member_bytes_received = nullptr;
       o.num_groups = 0;
       o.total_members = 0;
     }
@@ -204,10 +216,14 @@ struct CollectiveGroupCSR {
     free(members);
     free(group_types);
     free(group_roots);
+    free(member_bytes_sent);
+    free(member_bytes_received);
     offsets = nullptr;
     members = nullptr;
     group_types = nullptr;
     group_roots = nullptr;
+    member_bytes_sent = nullptr;
+    member_bytes_received = nullptr;
     num_groups = 0;
     total_members = 0;
   }

@@ -25,6 +25,8 @@ ReaderOutput readOTF2Trace(const std::string &trace_path);
 struct ReaderPhase1Output {
   size_t event_count;
   std::vector<std::vector<uint64_t>> comm_sets;
+  std::vector<uint64_t> coll_bytes_sent;
+  std::vector<uint64_t> coll_bytes_received;
   void *handle; // opaque; must pass to readerFillSoA then readerRelease
 };
 

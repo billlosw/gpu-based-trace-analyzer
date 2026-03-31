@@ -37,6 +37,8 @@ static uint64_t makePendingKey(int event_type, uint64_t cs_hash) {
 // 2. Comm_set caching: normalize (sort) each unique comm_set only once
 void buildCollectiveGroups(const TraceDataSoA &data,
                            const std::vector<std::vector<uint64_t>> &comm_sets,
+                           const std::vector<uint64_t> &coll_bytes_sent,
+                           const std::vector<uint64_t> &coll_bytes_received,
                            CollectiveGroupCSR &out_csr) {
   out_csr.deallocate();
 
@@ -144,9 +146,10 @@ void buildCollectiveGroups(const TraceDataSoA &data,
             // Group complete — move to completed, remove from pending index
             completed_groups.push_back(std::move(pg));
             pg.expected_size = 0; // Mark as dead
-            // Swap-remove from index list
-            idx_list[li] = idx_list.back();
-            idx_list.pop_back();
+            // Erase from index list (preserves FIFO order so events join
+            // the oldest matching group first — swap-remove would break
+            // temporal grouping when multiple groups share the same key)
+            idx_list.erase(idx_list.begin() + li);
             if (idx_list.empty())
               pending_by_key.erase(pkey);
           }
@@ -207,6 +210,8 @@ void buildCollectiveGroups(const TraceDataSoA &data,
   out_csr.members = (int32_t *)malloc(total_members * sizeof(int32_t));
   out_csr.group_types = (event_t *)malloc(num_groups * sizeof(event_t));
   out_csr.group_roots = (id_t *)malloc(num_groups * sizeof(id_t));
+  out_csr.member_bytes_sent = (uint64_t *)malloc(total_members * sizeof(uint64_t));
+  out_csr.member_bytes_received = (uint64_t *)malloc(total_members * sizeof(uint64_t));
 
   size_t offset = 0;
   for (size_t g = 0; g < num_groups; g++) {
@@ -214,7 +219,17 @@ void buildCollectiveGroups(const TraceDataSoA &data,
     out_csr.group_types[g] = completed_groups[g].type;
     out_csr.group_roots[g] = completed_groups[g].root;
     for (auto midx : completed_groups[g].member_indices) {
-      out_csr.members[offset++] = (int32_t)midx;
+      out_csr.members[offset] = (int32_t)midx;
+      // Look up bytes for this member via soa_to_commset mapping
+      auto cs_it = soa_to_commset.find(midx);
+      if (cs_it != soa_to_commset.end() && cs_it->second < coll_bytes_sent.size()) {
+        out_csr.member_bytes_sent[offset] = coll_bytes_sent[cs_it->second];
+        out_csr.member_bytes_received[offset] = coll_bytes_received[cs_it->second];
+      } else {
+        out_csr.member_bytes_sent[offset] = 0;
+        out_csr.member_bytes_received[offset] = 0;
+      }
+      offset++;
     }
   }
   out_csr.offsets[num_groups] = (int32_t)offset;

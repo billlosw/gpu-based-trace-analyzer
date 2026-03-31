@@ -8,8 +8,11 @@
 // Build collective group CSR from SoA data on the CPU.
 // Events must already be sorted by timestamp (as read from OTF2).
 // comm_sets: per-event communicator member lists (from OTF2 reader).
+// coll_bytes_sent/received: per-collective-event bytes (parallel to comm_sets).
 void buildCollectiveGroups(const TraceDataSoA &data,
                            const std::vector<std::vector<uint64_t>> &comm_sets,
+                           const std::vector<uint64_t> &coll_bytes_sent,
+                           const std::vector<uint64_t> &coll_bytes_received,
                            CollectiveGroupCSR &out_csr);
 
 #endif // GPU_ANALYZER_COLLECTIVE_GROUPING_H

@@ -55,6 +55,8 @@ struct GPUMemoryPool {
   int32_t *d_coll_members = nullptr;
   event_t *d_group_types = nullptr;
   id_t *d_group_roots = nullptr;
+  uint64_t *d_member_bytes_sent = nullptr;
+  uint64_t *d_member_bytes_received = nullptr;
 
   // Collective output arrays
   double *d_bw_out = nullptr, *d_bc_out = nullptr;

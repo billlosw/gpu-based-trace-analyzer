@@ -124,6 +124,10 @@ static void sendLocalData(const TraceDataSoA &data,
              MPI_COMM_WORLD);
     MPI_Send(csr.group_roots, (int)csr.num_groups, MPI_UINT32_T, 0, 19,
              MPI_COMM_WORLD);
+    MPI_Send(csr.member_bytes_sent, (int)csr.total_members, MPI_UINT64_T, 0, 20,
+             MPI_COMM_WORLD);
+    MPI_Send(csr.member_bytes_received, (int)csr.total_members, MPI_UINT64_T, 0, 21,
+             MPI_COMM_WORLD);
   }
 }
 
@@ -203,6 +207,12 @@ static void recvRankData(TraceDataSoA &data, CollectiveGroupCSR &csr,
       csr.group_types[i] = (event_t)gt_buf[i];
     MPI_Recv(csr.group_roots, (int)csr.num_groups, MPI_UINT32_T, src, 19,
              MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    csr.member_bytes_sent = (uint64_t *)malloc(csr.total_members * sizeof(uint64_t));
+    csr.member_bytes_received = (uint64_t *)malloc(csr.total_members * sizeof(uint64_t));
+    MPI_Recv(csr.member_bytes_sent, (int)csr.total_members, MPI_UINT64_T, src, 20,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Recv(csr.member_bytes_received, (int)csr.total_members, MPI_UINT64_T, src, 21,
+             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
   }
 }
 
@@ -281,6 +291,8 @@ static void mergeBatchData(std::vector<TraceDataSoA> &rank_data,
     batch_csr.members = (int32_t *)malloc(total_members * sizeof(int32_t));
     batch_csr.group_types = (event_t *)malloc(total_groups * sizeof(event_t));
     batch_csr.group_roots = (id_t *)malloc(total_groups * sizeof(id_t));
+    batch_csr.member_bytes_sent = (uint64_t *)malloc(total_members * sizeof(uint64_t));
+    batch_csr.member_bytes_received = (uint64_t *)malloc(total_members * sizeof(uint64_t));
 
     for (int r = 0; r < k; r++) {
       size_t goff = group_offsets[r];
@@ -308,6 +320,12 @@ static void mergeBatchData(std::vector<TraceDataSoA> &rank_data,
              ng * sizeof(event_t));
       memcpy(batch_csr.group_roots + goff, rank_csr[r].group_roots,
              ng * sizeof(id_t));
+      if (rank_csr[r].member_bytes_sent)
+        memcpy(batch_csr.member_bytes_sent + moff, rank_csr[r].member_bytes_sent,
+               nm * sizeof(uint64_t));
+      if (rank_csr[r].member_bytes_received)
+        memcpy(batch_csr.member_bytes_received + moff, rank_csr[r].member_bytes_received,
+               nm * sizeof(uint64_t));
     }
     batch_csr.offsets[total_groups] = (int32_t)total_members;
   }
@@ -598,6 +616,7 @@ struct MergedCSR {
   std::vector<int32_t> offsets, members;
   std::vector<int> group_types;
   std::vector<id_t> group_roots;
+  std::vector<uint64_t> member_bytes_sent, member_bytes_received;
   size_t total_groups = 0, total_members = 0;
   std::vector<int> group_counts, group_displs;
   std::vector<int> member_counts, member_displs;
@@ -649,6 +668,8 @@ static MergedCSR shmGatherCSR(const CollectiveGroupCSR &local_csr,
     merged.members.resize(merged.total_members);
     merged.group_types.resize(merged.total_groups);
     merged.group_roots.resize(merged.total_groups);
+    merged.member_bytes_sent.resize(merged.total_members);
+    merged.member_bytes_received.resize(merged.total_members);
   }
 
   MPI_Gatherv(adj_offsets.data(), (int)local_csr.num_groups, MPI_INT32_T,
@@ -674,6 +695,21 @@ static MergedCSR shmGatherCSR(const CollectiveGroupCSR &local_csr,
       (merged.total_groups > 0 && rank == 0) ? merged.group_roots.data()
                                              : nullptr,
       merged.group_counts.data(), merged.group_displs.data(), MPI_UINT32_T, 0,
+      shm_comm);
+
+  // Gather member bytes (indexed by member, not group)
+  MPI_Gatherv(
+      local_csr.member_bytes_sent, (int)local_csr.total_members, MPI_UINT64_T,
+      (merged.total_members > 0 && rank == 0) ? merged.member_bytes_sent.data()
+                                              : nullptr,
+      merged.member_counts.data(), merged.member_displs.data(), MPI_UINT64_T, 0,
+      shm_comm);
+
+  MPI_Gatherv(
+      local_csr.member_bytes_received, (int)local_csr.total_members, MPI_UINT64_T,
+      (merged.total_members > 0 && rank == 0) ? merged.member_bytes_received.data()
+                                              : nullptr,
+      merged.member_counts.data(), merged.member_displs.data(), MPI_UINT64_T, 0,
       shm_comm);
 
   if (rank == 0 && merged.total_groups > 0)
@@ -770,6 +806,10 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
           (event_t *)malloc(batch_num_groups * sizeof(event_t));
       batch_csr.group_roots =
           (id_t *)malloc(batch_num_groups * sizeof(id_t));
+      batch_csr.member_bytes_sent =
+          (uint64_t *)malloc(batch_total_members * sizeof(uint64_t));
+      batch_csr.member_bytes_received =
+          (uint64_t *)malloc(batch_total_members * sizeof(uint64_t));
 
       for (int g = 0; g < batch_num_groups; g++)
         batch_csr.offsets[g] =
@@ -787,6 +827,12 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
       memcpy(batch_csr.group_roots,
              merged.group_roots.data() + batch_group_off,
              batch_num_groups * sizeof(id_t));
+      memcpy(batch_csr.member_bytes_sent,
+             merged.member_bytes_sent.data() + batch_member_off,
+             batch_total_members * sizeof(uint64_t));
+      memcpy(batch_csr.member_bytes_received,
+             merged.member_bytes_received.data() + batch_member_off,
+             batch_total_members * sizeof(uint64_t));
     }
 
     auto tp_prep1 = std::chrono::high_resolution_clock::now();
@@ -911,7 +957,7 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
     phase1.handle = nullptr;
     runP2PMatching(local_data);
     CollectiveGroupCSR local_csr;
-    buildCollectiveGroups(local_data, phase1.comm_sets, local_csr);
+    buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
 #ifdef USE_SCALASCA_TIMESTAMPS
     if (time_correct)
       applyTimestampCorrection(local_data);
@@ -1040,7 +1086,7 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   // --- Collective Grouping (local, on shared window) ---
   tp0 = std::chrono::high_resolution_clock::now();
   CollectiveGroupCSR local_csr;
-  buildCollectiveGroups(local_data, phase1.comm_sets, local_csr);
+  buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
   tp1 = std::chrono::high_resolution_clock::now();
   t_coll_group = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
@@ -1225,11 +1271,12 @@ int main(int argc, char **argv) {
 
     runP2PMatching(local_data);
     CollectiveGroupCSR csr;
-    buildCollectiveGroups(local_data, phase1.comm_sets, csr);
+    buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, csr);
 #ifdef USE_SCALASCA_TIMESTAMPS
     if (time_correct)
       applyTimestampCorrection(local_data);
 #endif
+
     raw = runAnalysisKernels(local_data, csr);
   } else {
     // Multi-rank: direct-to-shared-memory analysis

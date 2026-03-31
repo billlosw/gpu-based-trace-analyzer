@@ -95,10 +95,12 @@ struct CollRedistBuffers {
   std::vector<std::vector<uint32_t>> roots;
   std::vector<std::vector<uint32_t>> pids;
   std::vector<std::vector<uint64_t>> flat_comm_sets; // [size, m0, m1, ...]
+  std::vector<std::vector<uint64_t>> bytes_sent;
+  std::vector<std::vector<uint64_t>> bytes_received;
 
   CollRedistBuffers(int np)
       : nprocs(np), op_types(np), begin_ts(np), end_ts(np), roots(np),
-        pids(np), flat_comm_sets(np) {}
+        pids(np), flat_comm_sets(np), bytes_sent(np), bytes_received(np) {}
 };
 
 // ============================================================
@@ -340,6 +342,8 @@ public:
       pushEvent(op_type, ENTER, begin_ts, end_ts, pid, 0, 0, 0, root);
       std::vector<uint64_t> cs(comm_set.begin(), comm_set.end());
       m_comm_sets.push_back(std::move(cs));
+      m_coll_bytes_sent.push_back(event.sent());
+      m_coll_bytes_received.push_back(event.received());
       m_coll_count++;
     } else {
       // Root is remote: buffer for redistribution
@@ -349,6 +353,8 @@ public:
       m_redist.end_ts[target].push_back(end_ts);
       m_redist.roots[target].push_back(root);
       m_redist.pids[target].push_back(pid);
+      m_redist.bytes_sent[target].push_back(event.sent());
+      m_redist.bytes_received[target].push_back(event.received());
       // Flatten comm_set
       m_redist.flat_comm_sets[target].push_back(comm_set.size());
       for (auto id : comm_set)
@@ -416,6 +422,8 @@ public:
   }
 
   std::vector<std::vector<uint64_t>> &getCommSets() { return m_comm_sets; }
+  std::vector<uint64_t> &getCollBytesSent() { return m_coll_bytes_sent; }
+  std::vector<uint64_t> &getCollBytesReceived() { return m_coll_bytes_received; }
 
   // Append received collective events after redistribution
   void appendCollectiveEvents(const std::vector<int> &recv_op_types,
@@ -423,11 +431,15 @@ public:
                               const std::vector<uint64_t> &recv_end_ts,
                               const std::vector<uint32_t> &recv_roots,
                               const std::vector<uint32_t> &recv_pids,
-                              const std::vector<std::vector<uint64_t>> &recv_cs) {
+                              const std::vector<std::vector<uint64_t>> &recv_cs,
+                              const std::vector<uint64_t> &recv_bytes_sent,
+                              const std::vector<uint64_t> &recv_bytes_received) {
     for (size_t i = 0; i < recv_pids.size(); i++) {
       pushEvent((event_t)recv_op_types[i], ENTER, recv_begin_ts[i],
                 recv_end_ts[i], recv_pids[i], 0, 0, 0, recv_roots[i]);
       m_comm_sets.push_back(recv_cs[i]);
+      m_coll_bytes_sent.push_back(recv_bytes_sent[i]);
+      m_coll_bytes_received.push_back(recv_bytes_received[i]);
       m_coll_count++;
     }
   }
@@ -452,6 +464,9 @@ private:
 
   // Comm sets for collective events
   std::vector<std::vector<uint64_t>> m_comm_sets;
+  // Per-collective-event bytes sent/received (parallel to m_comm_sets)
+  std::vector<uint64_t> m_coll_bytes_sent;
+  std::vector<uint64_t> m_coll_bytes_received;
 
   // Collective begin/end pairing
   std::unordered_map<id_t, timestamp_t> m_coll_begin_ts;
@@ -531,12 +546,15 @@ static void redistributeCollectives(Pass2DataCallback &cb,
     std::vector<int> g_op_types;
     std::vector<uint64_t> g_begin_ts, g_end_ts;
     std::vector<uint32_t> g_roots, g_pids;
+    std::vector<uint64_t> g_bytes_sent, g_bytes_received;
     if (rank == target) {
       g_op_types.resize(total);
       g_begin_ts.resize(total);
       g_end_ts.resize(total);
       g_roots.resize(total);
       g_pids.resize(total);
+      g_bytes_sent.resize(total);
+      g_bytes_received.resize(total);
     }
 
     // Gatherv fixed-length arrays
@@ -558,6 +576,14 @@ static void redistributeCollectives(Pass2DataCallback &cb,
     MPI_Gatherv(redist.pids[target].data(), local_count, MPI_UINT32_T,
                 rank == target ? g_pids.data() : nullptr, recv_counts.data(),
                 displs.data(), MPI_UINT32_T, target, MPI_COMM_WORLD);
+    MPI_Gatherv(redist.bytes_sent[target].data(), local_count, MPI_UINT64_T,
+                rank == target ? g_bytes_sent.data() : nullptr,
+                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
+                MPI_COMM_WORLD);
+    MPI_Gatherv(redist.bytes_received[target].data(), local_count, MPI_UINT64_T,
+                rank == target ? g_bytes_received.data() : nullptr,
+                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
+                MPI_COMM_WORLD);
 
     // Gatherv variable-length comm_sets
     int local_cs_len = (int)redist.flat_comm_sets[target].size();
@@ -593,7 +619,7 @@ static void redistributeCollectives(Pass2DataCallback &cb,
         pos += sz;
       }
       cb.appendCollectiveEvents(g_op_types, g_begin_ts, g_end_ts, g_roots,
-                                g_pids, recv_cs);
+                                g_pids, recv_cs, g_bytes_sent, g_bytes_received);
     }
   }
 }
@@ -849,6 +875,8 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
 
   result.event_count = data_cb->getEventCount();
   result.comm_sets = std::move(data_cb->getCommSets());
+  result.coll_bytes_sent = std::move(data_cb->getCollBytesSent());
+  result.coll_bytes_received = std::move(data_cb->getCollBytesReceived());
   result.handle = static_cast<void *>(data_cb);
   return result;
 }

@@ -132,6 +132,7 @@ __global__ void kernelBarrierWaitCompletion(
 // ============================================================
 // Kernel 3: Early Reduce (Reduce, Gather, Gatherv)
 // max(member_ts) - root_ts when root arrives early
+// Scalasca: only counts when root has getBytesReceived() != 0
 // ============================================================
 __global__ void kernelEarlyReduce(
     const timestamp_t *__restrict__ timestamps,
@@ -139,6 +140,8 @@ __global__ void kernelEarlyReduce(
     const int32_t *__restrict__ coll_offsets,
     const int32_t *__restrict__ coll_members,
     const event_t *__restrict__ group_types, const id_t *__restrict__ group_roots,
+    const uint64_t *__restrict__ member_bytes_sent,
+    const uint64_t *__restrict__ member_bytes_received,
     size_t num_groups, double *__restrict__ early_reduce_out,
     unsigned int *__restrict__ early_reduce_cnt) {
   int gid = blockIdx.x;
@@ -159,17 +162,22 @@ __global__ void kernelEarlyReduce(
 
   timestamp_t root_ts = 0;
   timestamp_t max_ts = 0;
+  bool root_receives = false;
 
   for (int j = start; j < end; j++) {
     int ev_idx = coll_members[j];
     timestamp_t ts = timestamps[ev_idx];
-    if (pids[ev_idx] == root_pid)
+    if (pids[ev_idx] == root_pid) {
       root_ts = ts;
-    if (ts > max_ts)
+      root_receives = (member_bytes_received[j] != 0);
+    }
+    // Scalasca: exclude zero-byte-sent members from max
+    if (member_bytes_sent[j] != 0 && ts > max_ts)
       max_ts = ts;
   }
 
-  if (max_ts > root_ts) {
+  // Scalasca: early_reduce only when root has getBytesReceived() != 0
+  if (root_receives && max_ts > root_ts) {
     unsigned int pos = atomicAdd(early_reduce_cnt, 1u);
     early_reduce_out[pos] = (double)(max_ts - root_ts);
   }
@@ -178,6 +186,7 @@ __global__ void kernelEarlyReduce(
 // ============================================================
 // Kernel 4: Late Broadcast (Bcast, Scatter, Scatterv)
 // root_ts - member_ts for members that arrived before root
+// Scalasca: excludes root and zero-byte-received members
 // ============================================================
 __global__ void kernelLateBroadcast(
     const timestamp_t *__restrict__ timestamps,
@@ -185,6 +194,7 @@ __global__ void kernelLateBroadcast(
     const int32_t *__restrict__ coll_offsets,
     const int32_t *__restrict__ coll_members,
     const event_t *__restrict__ group_types, const id_t *__restrict__ group_roots,
+    const uint64_t *__restrict__ member_bytes_received,
     size_t num_groups, double *__restrict__ late_bcast_out,
     unsigned int *__restrict__ late_bcast_cnt) {
   int gid = blockIdx.x;
@@ -213,9 +223,13 @@ __global__ void kernelLateBroadcast(
     }
   }
 
-  // Check each member
+  // Check each member (Scalasca: skip root and zero-byte-received)
   for (int j = start; j < end; j++) {
     int ev_idx = coll_members[j];
+    if (pids[ev_idx] == root_pid)
+      continue;
+    if (member_bytes_received[j] == 0)
+      continue;
     timestamp_t member_ts = timestamps[ev_idx];
     if (member_ts < root_ts) {
       unsigned int pos = atomicAdd(late_bcast_cnt, 1u);
@@ -227,13 +241,17 @@ __global__ void kernelLateBroadcast(
 // ============================================================
 // Kernel 5: Wait NxN + NxN Completion
 // Same as barrier wait/completion but for AlltoAll-type collectives
+// Scalasca: filters by bytes_sent/bytes_received for zero-byte members
 // ============================================================
 __global__ void kernelNxNWaitCompletion(
     const timestamp_t *__restrict__ timestamps,
     const timestamp_t *__restrict__ end_timestamps,
     const int32_t *__restrict__ coll_offsets,
     const int32_t *__restrict__ coll_members,
-    const event_t *__restrict__ group_types, size_t num_groups,
+    const event_t *__restrict__ group_types,
+    const uint64_t *__restrict__ member_bytes_sent,
+    const uint64_t *__restrict__ member_bytes_received,
+    size_t num_groups,
     double *__restrict__ wait_nxn_out, unsigned int *__restrict__ wait_nxn_cnt,
     double *__restrict__ nxn_completion_out,
     unsigned int *__restrict__ nxn_completion_cnt) {
@@ -264,9 +282,11 @@ __global__ void kernelNxNWaitCompletion(
     int ev_idx = coll_members[j];
     timestamp_t ts = timestamps[ev_idx];
     timestamp_t ets = end_timestamps[ev_idx];
-    if (ts > max_enter)
+    // Scalasca: exclude zero-byte-sent from max_enter (latest)
+    if (member_bytes_sent[j] != 0 && ts > max_enter)
       max_enter = ts;
-    if (ets < min_end)
+    // Scalasca: exclude zero-byte-received from min_end (earliest_end)
+    if (member_bytes_received[j] != 0 && ets < min_end)
       min_end = ets;
   }
 
@@ -274,11 +294,13 @@ __global__ void kernelNxNWaitCompletion(
     int ev_idx = coll_members[j];
     timestamp_t ts = timestamps[ev_idx];
     timestamp_t ets = end_timestamps[ev_idx];
-    if (max_enter > ts) {
+    // Scalasca wait_nxn: non-receivers don't have to wait
+    if (member_bytes_received[j] != 0 && max_enter > ts) {
       unsigned int pos = atomicAdd(wait_nxn_cnt, 1u);
       wait_nxn_out[pos] = (double)(max_enter - ts);
     }
-    if (ets > min_end) {
+    // Scalasca nxn_completion: only for members with both sent and received
+    if (member_bytes_sent[j] != 0 && member_bytes_received[j] != 0 && ets > min_end) {
       unsigned int pos = atomicAdd(nxn_completion_cnt, 1u);
       nxn_completion_out[pos] = (double)(ets - min_end);
     }
@@ -386,6 +408,7 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
     int32_t *d_coll_offsets, *d_coll_members;
     event_t *d_group_types;
     id_t *d_group_roots;
+    uint64_t *d_member_bytes_sent, *d_member_bytes_received;
 
     CUDA_CHECK(cudaMalloc(&d_coll_offsets,
                            (csr.num_groups + 1) * sizeof(int32_t)));
@@ -395,6 +418,10 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
         cudaMalloc(&d_group_types, csr.num_groups * sizeof(event_t)));
     CUDA_CHECK(
         cudaMalloc(&d_group_roots, csr.num_groups * sizeof(id_t)));
+    CUDA_CHECK(
+        cudaMalloc(&d_member_bytes_sent, csr.total_members * sizeof(uint64_t)));
+    CUDA_CHECK(
+        cudaMalloc(&d_member_bytes_received, csr.total_members * sizeof(uint64_t)));
 
     CUDA_CHECK(cudaMemcpy(d_coll_offsets, csr.offsets,
                            (csr.num_groups + 1) * sizeof(int32_t),
@@ -407,6 +434,12 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
                            cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_group_roots, csr.group_roots,
                            csr.num_groups * sizeof(id_t),
+                           cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_member_bytes_sent, csr.member_bytes_sent,
+                           csr.total_members * sizeof(uint64_t),
+                           cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_member_bytes_received, csr.member_bytes_received,
+                           csr.total_members * sizeof(uint64_t),
                            cudaMemcpyHostToDevice));
 
     // Allocate output arrays for all collective analyses
@@ -449,17 +482,20 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
     // Early Reduce
     kernelEarlyReduce<<<coll_grid, 1>>>(
         d_timestamps, d_pids, d_roots, d_coll_offsets, d_coll_members,
-        d_group_types, d_group_roots, csr.num_groups, d_er_out, d_er_cnt);
+        d_group_types, d_group_roots, d_member_bytes_sent,
+        d_member_bytes_received, csr.num_groups, d_er_out, d_er_cnt);
 
     // Late Broadcast
     kernelLateBroadcast<<<coll_grid, 1>>>(
         d_timestamps, d_pids, d_roots, d_coll_offsets, d_coll_members,
-        d_group_types, d_group_roots, csr.num_groups, d_lb_out, d_lb_cnt);
+        d_group_types, d_group_roots, d_member_bytes_received,
+        csr.num_groups, d_lb_out, d_lb_cnt);
 
     // NxN Wait + Completion
     kernelNxNWaitCompletion<<<coll_grid, 1>>>(
         d_timestamps, d_end_timestamps, d_coll_offsets, d_coll_members,
-        d_group_types, csr.num_groups, d_wn_out, d_wn_cnt, d_nc_out,
+        d_group_types, d_member_bytes_sent, d_member_bytes_received,
+        csr.num_groups, d_wn_out, d_wn_cnt, d_nc_out,
         d_nc_cnt);
 
     CUDA_CHECK(cudaEventRecord(ev_coll_done));
@@ -505,6 +541,8 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
     CUDA_CHECK(cudaFree(d_coll_members));
     CUDA_CHECK(cudaFree(d_group_types));
     CUDA_CHECK(cudaFree(d_group_roots));
+    CUDA_CHECK(cudaFree(d_member_bytes_sent));
+    CUDA_CHECK(cudaFree(d_member_bytes_received));
     CUDA_CHECK(cudaFree(d_bw_out));
     CUDA_CHECK(cudaFree(d_bc_out));
     CUDA_CHECK(cudaFree(d_er_out));
@@ -583,6 +621,8 @@ void GPUMemoryPool::allocate(size_t max_n, size_t max_members, size_t max_groups
     CUDA_CHECK(cudaMalloc(&d_coll_members, max_members * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&d_group_types, max_groups * sizeof(event_t)));
     CUDA_CHECK(cudaMalloc(&d_group_roots, max_groups * sizeof(id_t)));
+    CUDA_CHECK(cudaMalloc(&d_member_bytes_sent, max_members * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_member_bytes_received, max_members * sizeof(uint64_t)));
 
     // Collective output (max_members each)
     CUDA_CHECK(cudaMalloc(&d_bw_out, max_members * sizeof(double)));
@@ -611,6 +651,7 @@ void GPUMemoryPool::deallocate() {
   if (max_coll_groups > 0) {
     cudaFree(d_coll_offsets); cudaFree(d_coll_members);
     cudaFree(d_group_types); cudaFree(d_group_roots);
+    cudaFree(d_member_bytes_sent); cudaFree(d_member_bytes_received);
     cudaFree(d_bw_out); cudaFree(d_bc_out);
     cudaFree(d_er_out); cudaFree(d_lb_out);
     cudaFree(d_wn_out); cudaFree(d_nc_out);
@@ -625,6 +666,7 @@ void GPUMemoryPool::deallocate() {
   d_ls_cnt = nullptr; d_lr_cnt = nullptr;
   d_coll_offsets = nullptr; d_coll_members = nullptr;
   d_group_types = nullptr; d_group_roots = nullptr;
+  d_member_bytes_sent = nullptr; d_member_bytes_received = nullptr;
   d_bw_out = nullptr; d_bc_out = nullptr;
   d_er_out = nullptr; d_lb_out = nullptr;
   d_wn_out = nullptr; d_nc_out = nullptr;
@@ -717,6 +759,12 @@ RawAnalysisOutput runAnalysisKernelsAsync(const TraceDataSoA &data,
     CUDA_CHECK(cudaMemcpyAsync(pool.d_group_roots, csr.group_roots,
                                 csr.num_groups * sizeof(id_t),
                                 cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pool.d_member_bytes_sent, csr.member_bytes_sent,
+                                csr.total_members * sizeof(uint64_t),
+                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pool.d_member_bytes_received, csr.member_bytes_received,
+                                csr.total_members * sizeof(uint64_t),
+                                cudaMemcpyHostToDevice, stream));
 
     CUDA_CHECK(cudaMemsetAsync(pool.d_bw_cnt, 0, sizeof(unsigned int), stream));
     CUDA_CHECK(cudaMemsetAsync(pool.d_bc_cnt, 0, sizeof(unsigned int), stream));
@@ -735,16 +783,20 @@ RawAnalysisOutput runAnalysisKernelsAsync(const TraceDataSoA &data,
     kernelEarlyReduce<<<coll_grid, 1, 0, stream>>>(
         pool.d_timestamps, pool.d_pids, pool.d_roots, pool.d_coll_offsets,
         pool.d_coll_members, pool.d_group_types, pool.d_group_roots,
+        pool.d_member_bytes_sent, pool.d_member_bytes_received,
         csr.num_groups, pool.d_er_out, pool.d_er_cnt);
 
     kernelLateBroadcast<<<coll_grid, 1, 0, stream>>>(
         pool.d_timestamps, pool.d_pids, pool.d_roots, pool.d_coll_offsets,
         pool.d_coll_members, pool.d_group_types, pool.d_group_roots,
+        pool.d_member_bytes_received,
         csr.num_groups, pool.d_lb_out, pool.d_lb_cnt);
 
     kernelNxNWaitCompletion<<<coll_grid, 1, 0, stream>>>(
         pool.d_timestamps, pool.d_end_timestamps, pool.d_coll_offsets,
-        pool.d_coll_members, pool.d_group_types, csr.num_groups,
+        pool.d_coll_members, pool.d_group_types,
+        pool.d_member_bytes_sent, pool.d_member_bytes_received,
+        csr.num_groups,
         pool.d_wn_out, pool.d_wn_cnt, pool.d_nc_out, pool.d_nc_cnt);
 
     CUDA_CHECK(cudaEventRecord(ev_coll_done, stream));
