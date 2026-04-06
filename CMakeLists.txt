@@ -37,7 +37,9 @@ add_subdirectory(third_party/otf2xx)
 
 # Main library
 add_library(gpu_analyzer_lib STATIC
+    src/common/SHA256.cpp
     src/reader/OTF2SoAReader.cpp
+    src/reader/SoACache.cpp
     src/matching/P2PMatching.cpp
     src/matching/CollectiveGrouping.cpp
     src/analysis/AnalysisKernels.cu

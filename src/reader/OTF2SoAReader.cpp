@@ -1,4 +1,5 @@
 #include "reader/OTF2SoAReader.h"
+#include "reader/SoACache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -13,6 +14,23 @@
 
 #include <mpi.h>
 #include <otf2xx/otf2.hpp>
+
+// ============================================================
+// Handle tag: distinguishes OTF2 callback vs cached data handles
+// ============================================================
+enum HandleType : uint32_t { HANDLE_OTF2_CALLBACK = 0, HANDLE_CACHE = 1 };
+
+// Opaque handle wrapper: holds a tag + pointer to actual data
+struct ReaderHandle {
+  HandleType tag;
+  void *ptr; // either Pass2DataCallback* or CacheHandle*
+
+  ReaderHandle(HandleType t, void *p) : tag(t), ptr(p) {}
+};
+
+struct SoACacheDataHolder {
+  SoACacheData data;
+};
 
 // ============================================================
 // Helper: contiguous block assignment (handles remainder)
@@ -836,8 +854,53 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
 }
 
 // ============================================================
-// Split-phase reader API
+// Split-phase reader API (with binary SoA cache support)
 // ============================================================
+
+// Helper: extract vectors from Pass2DataCallback into SoACacheData for caching.
+static SoACacheData extractCacheData(Pass2DataCallback &cb) {
+  SoACacheData cd;
+  size_t n = cb.getEventCount();
+
+  // We need to extract the raw vectors from the callback.
+  // Build a temporary SoA and copy from it.
+  TraceDataSoA tmp;
+  cb.fillSoA(tmp);
+
+  cd.events.resize(n);
+  cd.types.resize(n);
+  cd.timestamps.resize(n);
+  cd.end_timestamps.resize(n);
+  cd.pids.resize(n);
+  cd.srcs.resize(n);
+  cd.dsts.resize(n);
+  cd.tags.resize(n);
+  cd.roots.resize(n);
+
+  for (size_t i = 0; i < n; i++) {
+    cd.events[i] = (int32_t)tmp.events[i];
+    cd.types[i] = (int32_t)tmp.types[i];
+  }
+  std::memcpy(cd.timestamps.data(), tmp.timestamps, n * sizeof(uint64_t));
+  std::memcpy(cd.end_timestamps.data(), tmp.end_timestamps, n * sizeof(uint64_t));
+  std::memcpy(cd.pids.data(), tmp.pids, n * sizeof(uint32_t));
+  std::memcpy(cd.srcs.data(), tmp.srcs, n * sizeof(uint32_t));
+  std::memcpy(cd.dsts.data(), tmp.dsts, n * sizeof(uint32_t));
+  std::memcpy(cd.tags.data(), tmp.tags, n * sizeof(uint32_t));
+  std::memcpy(cd.roots.data(), tmp.roots, n * sizeof(uint32_t));
+
+#ifdef USE_SCALASCA_TIMESTAMPS
+  auto &lrt = cb.getLeaveRecvTs();
+  cd.leave_recv_ts.assign(lrt.begin(), lrt.end());
+#endif
+
+  cd.comm_sets = cb.getCommSets(); // copy (we still need them in result)
+  cd.coll_bytes_sent = cb.getCollBytesSent();
+  cd.coll_bytes_received = cb.getCollBytesReceived();
+
+  return cd;
+}
+
 ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
   ReaderPhase1Output result;
   result.handle = nullptr;
@@ -848,6 +911,52 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
 
   auto t_start = std::chrono::high_resolution_clock::now();
 
+  // ======== FINGERPRINT & CACHE CHECK ========
+  uint8_t fingerprint[32];
+  if (rank == 0) {
+    computeFileFingerprint(trace_path, fingerprint);
+  }
+  MPI_Bcast(fingerprint, 32, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+  std::string cache_path = getCachePath(trace_path, rank, comm_sz);
+  SoACacheData cached;
+  bool cache_hit = readSoACache(cache_path, fingerprint, rank, comm_sz, cached);
+
+  // All ranks must agree: if any rank has cache miss, all re-read OTF2
+  int local_hit = cache_hit ? 1 : 0;
+  int global_hit = 0;
+  MPI_Allreduce(&local_hit, &global_hit, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  cache_hit = (global_hit == 1);
+
+  if (cache_hit) {
+    auto t_cache = std::chrono::high_resolution_clock::now();
+    double cache_ms =
+        std::chrono::duration<double, std::milli>(t_cache - t_start).count();
+
+    if (rank == 0) {
+      std::cout << "[Reader] SoA cache HIT (" << cached.events.size()
+                << " events on rank 0), loaded in " << cache_ms << " ms"
+                << std::endl;
+    }
+
+    result.event_count = cached.events.size();
+    result.comm_sets = std::move(cached.comm_sets);
+    result.coll_bytes_sent = std::move(cached.coll_bytes_sent);
+    result.coll_bytes_received = std::move(cached.coll_bytes_received);
+
+    auto *holder = new SoACacheDataHolder();
+    holder->data = std::move(cached);
+    result.handle = static_cast<void *>(
+        new ReaderHandle(HANDLE_CACHE, static_cast<void *>(holder)));
+    return result;
+  }
+
+  if (rank == 0) {
+    std::cout << "[Reader] SoA cache MISS, performing OTF2 two-pass read..."
+              << std::endl;
+  }
+
+  // ======== NORMAL OTF2 TWO-PASS READ ========
   std::unordered_set<id_t> related_locs;
   id_t start_loc = 0, end_loc = 0, nlocs = 0;
 
@@ -956,27 +1065,80 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
               << ")" << std::endl;
   }
 
+  // ======== WRITE SOA CACHE ========
+  {
+    auto t_cache0 = std::chrono::high_resolution_clock::now();
+    SoACacheData cd = extractCacheData(*data_cb);
+    bool ok = writeSoACache(cache_path, fingerprint, rank, comm_sz, cd);
+    auto t_cache1 = std::chrono::high_resolution_clock::now();
+    double cache_write_ms =
+        std::chrono::duration<double, std::milli>(t_cache1 - t_cache0).count();
+    if (rank == 0) {
+      if (ok)
+        std::cout << "[Reader] SoA cache written to " << cache_path
+                  << " in " << cache_write_ms << " ms" << std::endl;
+      else
+        std::cout << "[Reader] SoA cache write FAILED" << std::endl;
+    }
+  }
+
   result.event_count = data_cb->getEventCount();
   result.comm_sets = std::move(data_cb->getCommSets());
   result.coll_bytes_sent = std::move(data_cb->getCollBytesSent());
   result.coll_bytes_received = std::move(data_cb->getCollBytesReceived());
-  result.handle = static_cast<void *>(data_cb);
+  result.handle = static_cast<void *>(
+      new ReaderHandle(HANDLE_OTF2_CALLBACK, static_cast<void *>(data_cb)));
   return result;
 }
 
 void readerFillSoA(void *handle, TraceDataSoA &data) {
-  auto *cb = static_cast<Pass2DataCallback *>(handle);
+  auto *rh = static_cast<ReaderHandle *>(handle);
+  if (rh->tag == HANDLE_CACHE) {
+    auto *holder = static_cast<SoACacheDataHolder *>(rh->ptr);
+    size_t n = holder->data.events.size();
+    data.count = n;
+    if (n == 0) return;
+    for (size_t i = 0; i < n; i++)
+      data.events[i] = (event_t)holder->data.events[i];
+    for (size_t i = 0; i < n; i++)
+      data.types[i] = (event_type_t)holder->data.types[i];
+    std::memcpy(data.timestamps, holder->data.timestamps.data(), n * sizeof(timestamp_t));
+    std::memcpy(data.end_timestamps, holder->data.end_timestamps.data(), n * sizeof(timestamp_t));
+    std::memcpy(data.pids, holder->data.pids.data(), n * sizeof(id_t));
+    std::memcpy(data.srcs, holder->data.srcs.data(), n * sizeof(id_t));
+    std::memcpy(data.dsts, holder->data.dsts.data(), n * sizeof(id_t));
+    std::memcpy(data.tags, holder->data.tags.data(), n * sizeof(id_t));
+    std::memcpy(data.roots, holder->data.roots.data(), n * sizeof(id_t));
+    std::memcpy(data.replay_pids, holder->data.pids.data(), n * sizeof(id_t));
+    std::memset(data.tids, 0, n * sizeof(id_t));
+    for (size_t i = 0; i < n; i++)
+      data.indices[i] = (id_t)i;
+    std::memset(data.match_partner, 0xFF, n * sizeof(int32_t));
+    std::memset(data.coll_group_id, 0xFF, n * sizeof(int32_t));
+    return;
+  }
+  auto *cb = static_cast<Pass2DataCallback *>(rh->ptr);
   cb->fillSoAInto(data);
 }
 
 #ifdef USE_SCALASCA_TIMESTAMPS
 std::vector<timestamp_t> readerGetLeaveRecvTs(void *handle) {
-  auto *cb = static_cast<Pass2DataCallback *>(handle);
+  auto *rh = static_cast<ReaderHandle *>(handle);
+  if (rh->tag == HANDLE_CACHE) {
+    auto *holder = static_cast<SoACacheDataHolder *>(rh->ptr);
+    return std::move(holder->data.leave_recv_ts);
+  }
+  auto *cb = static_cast<Pass2DataCallback *>(rh->ptr);
   return std::move(cb->getLeaveRecvTs());
 }
 #endif
 
 void readerRelease(void *handle) {
-  auto *cb = static_cast<Pass2DataCallback *>(handle);
-  delete cb;
+  auto *rh = static_cast<ReaderHandle *>(handle);
+  if (rh->tag == HANDLE_CACHE) {
+    delete static_cast<SoACacheDataHolder *>(rh->ptr);
+  } else {
+    delete static_cast<Pass2DataCallback *>(rh->ptr);
+  }
+  delete rh;
 }
