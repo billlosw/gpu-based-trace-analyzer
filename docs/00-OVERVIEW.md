@@ -113,4 +113,5 @@ Validated on CG Class B and CG Class C traces (64 locations). See [09-TESTING.md
 | [11-ARCHITECTURE-RESEARCH.md](./11-ARCHITECTURE-RESEARCH.md) | Architecture exploration and research notes |
 | [12-PERFORMANCE-COMPARISON.md](./12-PERFORMANCE-COMPARISON.md) | Performance comparison: GPU Analyzer vs Scalasca |
 | [13-PERFORMANCE-ENHANCEMENT-PLAN.md](./13-PERFORMANCE-ENHANCEMENT-PLAN.md) | Prioritized performance optimization roadmap |
+| [14-DATA-ARCHITECTURE-RESEARCH.md](./14-DATA-ARCHITECTURE-RESEARCH.md) | GPU P2P/collective preprocessing, multi-GPU architecture, cuFile feasibility |
 | [PROBLEMS.md](./PROBLEMS.md) | Known issues, potential bugs, TODOs |
