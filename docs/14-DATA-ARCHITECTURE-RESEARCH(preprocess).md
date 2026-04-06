@@ -433,7 +433,7 @@ No file format change is needed: the same column-major cache file works for both
 
 ### Phase 1: Column-Major Single Cache File (No Code Change in Analysis)
 
-**Status**: Design complete (see `chat-history/260406-1500-soa-cache-architecture-strategy.md`)
+**Status**: Design complete (see `chat-history/260406-1400-soa-cache-architecture-strategy.md`)
 
 - Merge per-rank files into one column-major file
 - Use mmap instead of fread + SHM

@@ -96,7 +96,7 @@ void allocate(size_t n) {
 
 `TraceDataSoA` has an `owns_memory` flag (default `true`):
 - When `owns_memory == true`: `allocate()` uses `calloc`, `deallocate()` calls `free` on all arrays. This is the standard path for single-rank mode.
-- When `owns_memory == false`: `deallocate()` only nullifies pointers without calling `free()`. This is used when the SoA points into an MPI shared memory window (`MPI_Win_allocate_shared`), where the window manages the memory lifecycle.
+- When `owns_memory == false`: `deallocate()` only nullifies pointers without calling `free()`. This is used when the SoA points into an MPI shared memory window (`MPI_Win_allocate_shared`), where the window manages the memory lifecycle. Also used in the column-major mmap path, where read-only pointers reference mmap'd file regions and writable arrays live in a separate SHM window.
 
 The struct is move-only (deleted copy constructor/assignment). The destructor calls `deallocate()` which respects the `owns_memory` flag.
 
@@ -151,11 +151,16 @@ for (int j = offsets[g]; j < offsets[g+1]; j++) {
 struct ReaderPhase1Output {
     size_t event_count;                         // Number of events this rank will store
     std::vector<std::vector<uint64_t>> comm_sets;  // Communicator member lists
+    std::vector<uint64_t> coll_bytes_sent;      // Per-event collective bytes
+    std::vector<uint64_t> coll_bytes_received;
     void *handle;                               // Opaque pointer to Pass2DataCallback
+    ColumnMajorMmap *colmajor_mmap = nullptr;   // Non-null on colmajor cache hit
 };
 ```
 
 The split-phase API separates reading from storage: `readOTF2TracePhase1()` returns event count and comm_sets without allocating the SoA, allowing the caller to choose the target memory (local calloc or shared window). Then `readerFillSoA(handle, data)` copies internal vectors into the pre-set SoA, and `readerRelease(handle)` frees the reader's internal state.
+
+When `colmajor_mmap` is non-null (column-major cache hit), the caller uses `colmajorDirectAnalysis()` instead of `sharedMemoryDirectAnalysis()`. The mmap'd data provides zero-copy read-only access to all SoA columns; `readerFillSoA()` is a no-op in this path.
 
 ## RawAnalysisOutput — Kernel Results
 

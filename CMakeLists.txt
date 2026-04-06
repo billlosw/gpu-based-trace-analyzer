@@ -40,6 +40,7 @@ add_library(gpu_analyzer_lib STATIC
     src/common/SHA256.cpp
     src/reader/OTF2SoAReader.cpp
     src/reader/SoACache.cpp
+    src/reader/ColumnMajorCache.cpp
     src/matching/P2PMatching.cpp
     src/matching/CollectiveGrouping.cpp
     src/analysis/AnalysisKernels.cu

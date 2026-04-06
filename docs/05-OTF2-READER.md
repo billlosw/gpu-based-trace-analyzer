@@ -320,14 +320,14 @@ All ranks must agree on cache validity (`MPI_Allreduce MIN`). If any rank's cach
 
 ### Integration
 
-Cache logic is integrated into `readOTF2TracePhase1()`. The opaque handle uses a `ReaderHandle` wrapper with a tag to dispatch between OTF2 callback data and cached data:
+Cache logic is integrated into `readOTF2TracePhase1()`. The opaque handle uses a `ReaderHandle` wrapper with a tag to dispatch between OTF2 callback data, per-rank cache, and column-major mmap:
 
 ```cpp
-enum HandleType { HANDLE_OTF2_CALLBACK, HANDLE_CACHE };
+enum HandleType { HANDLE_OTF2_CALLBACK, HANDLE_CACHE, HANDLE_COLMAJOR };
 struct ReaderHandle { HandleType tag; void *ptr; };
 ```
 
-The existing `readerFillSoA()`, `readerGetLeaveRecvTs()`, and `readerRelease()` functions dispatch based on the handle tag — the public API is unchanged.
+The existing `readerFillSoA()`, `readerGetLeaveRecvTs()`, and `readerRelease()` functions dispatch based on the handle tag — the public API is unchanged. For `HANDLE_COLMAJOR`, `readerFillSoA()` is a no-op (data served from mmap) and `readerRelease()` is a no-op (mmap owned by `ReaderPhase1Output::colmajor_mmap`).
 
 ### Performance Impact
 
@@ -339,3 +339,90 @@ The existing `readerFillSoA()`, `readerGetLeaveRecvTs()`, and `readerRelease()` 
 End-to-end pipeline improvement: 19,716 → 453 ms (16q, **43x**), 266,244 → 24,408 ms (n1024, **11x**).
 
 Cache write is a one-time cost (~1.7s for 16q, ~130s for n1024) amortized over all subsequent runs.
+
+## Column-Major SoA Cache (mmap)
+
+**Source**: `src/reader/ColumnMajorCache.cpp`
+**Header**: `include/reader/ColumnMajorCache.h`
+
+### Concept
+
+A single binary file containing all ranks' data in column-major order, designed for zero-copy mmap access. Instead of N per-rank files read via `fread`, one file is mmap'd by all processes simultaneously. Read-only columns (events, types, timestamps, etc.) are accessed directly through mmap pointers; only writable arrays (match_partner, coll_group_id, etc.) use a separate MPI SHM window.
+
+### Cache File Format
+
+Single file: `<trace_dir>/soa_cache/soa_cache_colmajor_n<nprocs>.bin`
+
+```
+Header (4KB padded):
+  magic:              8 bytes  0x4C4F434D414F53 ("SOAMCOL")
+  version:            4 bytes  uint32 (1)
+  flags:              4 bytes  uint32 (bit 0 = has_leave_recv_ts)
+  nprocs:             4 bytes  uint32
+  total_events:       8 bytes  uint64
+  fingerprint:        32 bytes SHA-256
+  metadata_offset:    8 bytes  uint64 (file offset to metadata section)
+  rank_event_counts:  nprocs × 8 bytes  uint64[]
+  column_offsets:     10 × 8 bytes  uint64[] (file offset per column)
+  column_elem_sizes:  10 × 4 bytes  uint32[] (bytes per element)
+  [padding to 4KB boundary]
+
+Columns (each 4KB-aligned):
+  COL_EVENTS[total]:         int32   (event_t as int)
+  COL_TYPES[total]:          int32   (event_type_t as int)
+  COL_TIMESTAMPS[total]:     uint64
+  COL_END_TIMESTAMPS[total]: uint64
+  COL_PIDS[total]:           uint32
+  COL_SRCS[total]:           uint32
+  COL_DSTS[total]:           uint32
+  COL_TAGS[total]:           uint32
+  COL_ROOTS[total]:          uint32
+  COL_LEAVE_RECV_TS[total]:  uint64  (if has_leave_recv_ts)
+
+  Within each column: [rank0_data | rank1_data | ... | rankP-1_data]
+
+Metadata section (after columns):
+  Per-rank: comm_sets + coll_bytes_sent + coll_bytes_received
+  Serialized as: [num_sets:u64, for each: (size:u64, members[size]:u64),
+                  coll_bytes_sent[num_sets]:u64, coll_bytes_received[num_sets]:u64]
+```
+
+4KB alignment on columns enables future direct-I/O or cuFile (GDS) compatibility.
+
+### Writer
+
+`writeColumnMajorCache()` is called collectively by all MPI ranks on cache miss (after per-rank cache write). Uses `MPI_Allgather` for event counts, `MPI_Gatherv` for column data (with chunked `MPI_Send/Recv` fallback when data exceeds INT_MAX). Rank 0 writes the file.
+
+### Reader (mmap)
+
+`openColumnMajorCache()` opens the file and mmap's the entire file with `MAP_PRIVATE | PROT_READ | PROT_WRITE`. `MAP_PRIVATE` enables COW semantics needed for `cudaHostRegister` (which requires writable pages). No actual writes occur to read-only columns, so no COW copies happen.
+
+The `ColumnMajorMmap` struct provides:
+- Column pointers into the mmap'd region (`column_ptrs[10]`)
+- Rank boundaries for slicing (`rank_boundaries[nprocs+1]`)
+- `rankSlice<T>(col, rank)` template for typed per-rank access
+- Metadata (comm_sets, coll_bytes) parsed into heap on open
+
+### Integration with Pipeline
+
+Check order in `readOTF2TracePhase1()`:
+1. Column-major cache (mmap) — checked first (fastest)
+2. Per-rank binary cache (fread) — checked second
+3. OTF2 two-pass read — fallback on cache miss
+
+On colmajor hit, `ReaderPhase1Output::colmajor_mmap` is non-null. `main.cu` dispatches to `colmajorDirectAnalysis()` which:
+1. Calls `madvise(MADV_HUGEPAGE)` + distributed prefault (per-page touch by each rank)
+2. Allocates a small SHM window for writable arrays only (~6 arrays × total_events)
+3. Points `TraceDataSoA` read-only fields to mmap, writable fields to SHM
+4. Runs P2P matching, collective grouping, timestamp correction as normal
+5. Rank 0 pins mmap'd columns via `cudaHostRegister` for DMA H2D
+6. Runs batched GPU analysis
+
+### Performance Impact
+
+| Trace | Per-rank cache read | Colmajor mmap | Speedup |
+|-------|---------------------|---------------|---------|
+| 16q (4M events, 8 ranks) | 24 ms | 2.7 ms | **8.9x** |
+| n1024 (262M events, 64 ranks) | ~8,000 ms (est.) | 3,700 ms | **~2x** |
+
+End-to-end (n1024, cache hit → analysis complete): ~27s (colmajor mmap path).

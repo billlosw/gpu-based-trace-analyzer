@@ -937,6 +937,477 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
   return output;
 }
 
+// ============================================================
+// Column-Major mmap Analysis Path
+// ============================================================
+// When a column-major cache file is available, all ranks mmap the same file.
+// Read-only columns (events, types, timestamps, etc.) served directly from mmap.
+// Writable arrays (match_partner, coll_group_id, tids, replay_pids, indices)
+// allocated in a small dedicated buffer. This eliminates the MPI SHM window,
+// fread, and the heap→SHM copy.
+
+static ShmAnalysisResult
+colmajorDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
+                       bool time_correct) {
+  ShmAnalysisResult result;
+  ColumnMajorMmap &cm = *phase1.colmajor_mmap;
+
+  auto tp0 = std::chrono::high_resolution_clock::now();
+  auto tp1 = tp0;
+  double t_setup = 0, t_writable_alloc = 0, t_fill = 0,
+         t_p2p = 0, t_coll = 0, t_ts_correct = 0,
+         t_remap_fence = 0, t_csr_gather = 0, t_pin = 0, t_gpu_batches = 0,
+         t_cleanup = 0;
+
+  // --- Build soa_offsets and all_counts from mmap metadata ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  std::vector<size_t> soa_offsets(nprocs + 1);
+  std::vector<int> all_counts(nprocs);
+  size_t total_events = (size_t)cm.total_events;
+  for (int i = 0; i <= nprocs; i++)
+    soa_offsets[i] = (size_t)cm.rank_boundaries[i];
+  for (int i = 0; i < nprocs; i++)
+    all_counts[i] = (int)(soa_offsets[i + 1] - soa_offsets[i]);
+
+  size_t my_off = soa_offsets[rank];
+  size_t my_cnt = (size_t)cm.rankEventCount(rank);
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_setup = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  if (rank == 0) {
+    std::cout << "[ColMajor] mmap-based shared mode: " << total_events
+              << " total events, " << (cm.mmap_size / (1024 * 1024))
+              << " MB mmap'd file" << std::endl;
+  }
+
+  if (total_events == 0) {
+    readerRelease(phase1.handle);
+    phase1.handle = nullptr;
+    return result;
+  }
+
+  // --- Allocate writable arrays (per-rank, not shared via MPI window) ---
+  // We need: tids, replay_pids, indices, match_partner, coll_group_id
+  // These are the only arrays that need to be writable.
+  // We also need a shared buffer visible to rank 0 for match_partner and
+  // end_timestamps (timestamp correction writes to end_timestamps).
+  //
+  // Design: Use MPI_Win_allocate_shared for just the writable arrays.
+  // Read-only data comes from mmap; writable data from SHM window.
+
+  tp0 = std::chrono::high_resolution_clock::now();
+
+  // Prefault + huge pages on mmap'd region for TLB efficiency.
+  // madvise applies to the entire file; each rank prefaults its own slice
+  // by reading one byte per page (4KB stride) to warm the page cache.
+  if (rank == 0)
+    madvise(cm.mmap_base, cm.mmap_size, MADV_HUGEPAGE);
+  MPI_Barrier(MPI_COMM_WORLD);
+  {
+    // Each rank touches its own slice of each column to prefault pages
+    const size_t PAGE = 4096;
+    volatile char sink = 0;
+    for (int c = 0; c < COLMAJOR_MAX_COLUMNS; c++) {
+      if (!cm.column_ptrs[c]) continue;
+      const char *col_base = (const char *)cm.column_ptrs[c];
+      size_t elem_sz = cm.column_elem_sizes[c];
+      size_t byte_off = my_off * elem_sz;
+      size_t byte_len = my_cnt * elem_sz;
+      for (size_t p = 0; p < byte_len; p += PAGE)
+        sink = col_base[byte_off + p];
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // Writable buffer layout (5 arrays)
+  struct WritableLayout {
+    size_t tids_off, replay_pids_off, indices_off;
+    size_t match_partner_off, coll_group_id_off;
+    size_t end_timestamps_copy_off; // writeable copy for timestamp correction
+    size_t total_bytes;
+
+    void compute(size_t n) {
+      size_t off = 0;
+      tids_off = off;               off += ShmSoALayout::alignPage(n * sizeof(id_t));
+      replay_pids_off = off;         off += ShmSoALayout::alignPage(n * sizeof(id_t));
+      indices_off = off;             off += ShmSoALayout::alignPage(n * sizeof(id_t));
+      match_partner_off = off;       off += ShmSoALayout::alignPage(n * sizeof(int32_t));
+      coll_group_id_off = off;       off += ShmSoALayout::alignPage(n * sizeof(int32_t));
+      end_timestamps_copy_off = off; off += ShmSoALayout::alignPage(n * sizeof(timestamp_t));
+      total_bytes = off;
+    }
+  } wlayout;
+  wlayout.compute(total_events);
+
+  // Use MPI SHM window for writable arrays (need shared visibility for match_partner remap + GPU)
+  MPI_Comm shm_comm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank,
+                      MPI_INFO_NULL, &shm_comm);
+  int shm_size;
+  MPI_Comm_size(shm_comm, &shm_size);
+
+  if (shm_size != nprocs) {
+    // Multi-node fallback: use per-rank local alloc path
+    if (rank == 0)
+      std::cerr << "[ColMajor] Multi-node not supported for colmajor path, falling back" << std::endl;
+    MPI_Comm_free(&shm_comm);
+    // Fall through to legacy SHM approach
+    return result; // caller should check and fallback
+  }
+
+  MPI_Win wwin;
+  void *wbase_ptr = nullptr;
+  MPI_Aint wwin_size = (rank == 0) ? (MPI_Aint)wlayout.total_bytes : 0;
+  MPI_Win_allocate_shared(wwin_size, 1, MPI_INFO_NULL, shm_comm, &wbase_ptr, &wwin);
+
+  if (rank != 0) {
+    MPI_Aint sz; int disp;
+    MPI_Win_shared_query(wwin, 0, &sz, &disp, &wbase_ptr);
+  }
+  char *wbase = (char *)wbase_ptr;
+
+  // Prefault writable arrays
+  if (rank == 0)
+    madvise(wbase, wlayout.total_bytes, MADV_HUGEPAGE);
+  MPI_Barrier(shm_comm);
+  if (my_cnt > 0) {
+    memset((id_t *)(wbase + wlayout.tids_off) + my_off, 0, my_cnt * sizeof(id_t));
+    memset((id_t *)(wbase + wlayout.replay_pids_off) + my_off, 0, my_cnt * sizeof(id_t));
+    memset((id_t *)(wbase + wlayout.indices_off) + my_off, 0, my_cnt * sizeof(id_t));
+    memset((int32_t *)(wbase + wlayout.match_partner_off) + my_off, 0xFF, my_cnt * sizeof(int32_t));
+    memset((int32_t *)(wbase + wlayout.coll_group_id_off) + my_off, 0xFF, my_cnt * sizeof(int32_t));
+    // Copy end_timestamps to writable buffer (for timestamp correction)
+    const timestamp_t *mmap_end_ts = cm.rankSlice<timestamp_t>(ColumnMajorMmap::COL_END_TIMESTAMPS, rank);
+    memcpy((timestamp_t *)(wbase + wlayout.end_timestamps_copy_off) + my_off,
+           mmap_end_ts, my_cnt * sizeof(timestamp_t));
+  }
+  MPI_Barrier(shm_comm);
+
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_writable_alloc = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // --- Set up local TraceDataSoA pointing to mmap (read-only) + writable arrays ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  MPI_Win_fence(0, wwin);
+
+  TraceDataSoA local_data;
+  local_data.owns_memory = false;
+  local_data.capacity = my_cnt;
+  local_data.count = my_cnt;
+
+  // Read-only from mmap (cast away const — these will only be read)
+  local_data.events = const_cast<event_t *>(
+      reinterpret_cast<const event_t *>(cm.column_ptrs[ColumnMajorMmap::COL_EVENTS]) + my_off);
+  local_data.types = const_cast<event_type_t *>(
+      reinterpret_cast<const event_type_t *>(cm.column_ptrs[ColumnMajorMmap::COL_TYPES]) + my_off);
+  local_data.timestamps = const_cast<timestamp_t *>(
+      reinterpret_cast<const timestamp_t *>(cm.column_ptrs[ColumnMajorMmap::COL_TIMESTAMPS]) + my_off);
+  // end_timestamps points to the writable copy
+  local_data.end_timestamps = (timestamp_t *)(wbase + wlayout.end_timestamps_copy_off) + my_off;
+  local_data.pids = const_cast<id_t *>(
+      reinterpret_cast<const id_t *>(cm.column_ptrs[ColumnMajorMmap::COL_PIDS]) + my_off);
+  local_data.srcs = const_cast<id_t *>(
+      reinterpret_cast<const id_t *>(cm.column_ptrs[ColumnMajorMmap::COL_SRCS]) + my_off);
+  local_data.dsts = const_cast<id_t *>(
+      reinterpret_cast<const id_t *>(cm.column_ptrs[ColumnMajorMmap::COL_DSTS]) + my_off);
+  local_data.tags = const_cast<id_t *>(
+      reinterpret_cast<const id_t *>(cm.column_ptrs[ColumnMajorMmap::COL_TAGS]) + my_off);
+  local_data.roots = const_cast<id_t *>(
+      reinterpret_cast<const id_t *>(cm.column_ptrs[ColumnMajorMmap::COL_ROOTS]) + my_off);
+
+  // Writable arrays from SHM window
+  local_data.tids = (id_t *)(wbase + wlayout.tids_off) + my_off;
+  local_data.replay_pids = (id_t *)(wbase + wlayout.replay_pids_off) + my_off;
+  local_data.indices = (id_t *)(wbase + wlayout.indices_off) + my_off;
+  local_data.match_partner = (int32_t *)(wbase + wlayout.match_partner_off) + my_off;
+  local_data.coll_group_id = (int32_t *)(wbase + wlayout.coll_group_id_off) + my_off;
+
+  // Initialize replay_pids = pids, indices[i] = i
+  if (my_cnt > 0) {
+    memcpy(local_data.replay_pids, local_data.pids, my_cnt * sizeof(id_t));
+    for (size_t i = 0; i < my_cnt; i++)
+      local_data.indices[i] = (id_t)i;
+  }
+
+  // Release the reader handle (sentinel for colmajor)
+  readerRelease(phase1.handle);
+  phase1.handle = nullptr;
+
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_fill = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // --- P2P Matching ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  runP2PMatching(local_data);
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_p2p = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // --- Collective Grouping ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  CollectiveGroupCSR local_csr;
+  buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent,
+                        phase1.coll_bytes_received, local_csr);
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_coll = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // --- Timestamp Correction ---
+#ifdef USE_SCALASCA_TIMESTAMPS
+  if (time_correct) {
+    tp0 = std::chrono::high_resolution_clock::now();
+    size_t local_violations = applyTimestampCorrection(local_data);
+    tp1 = std::chrono::high_resolution_clock::now();
+    t_ts_correct = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+    size_t total_violations = 0;
+    MPI_Reduce(&local_violations, &total_violations, 1, MPI_UNSIGNED_LONG,
+               MPI_SUM, 0, MPI_COMM_WORLD);
+    if (rank == 0)
+      std::cout << "[CLC] Total violations: " << total_violations << std::endl;
+  }
+#endif
+
+  // --- Remap match_partner to global + fence ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  if (my_cnt > 0 && my_off > 0) {
+    for (size_t i = 0; i < my_cnt; i++) {
+      int32_t mp = local_data.match_partner[i];
+      if (mp >= 0)
+        local_data.match_partner[i] = mp + (int32_t)my_off;
+    }
+  }
+  MPI_Win_fence(0, wwin);
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_remap_fence = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // --- Gather CSR ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  MergedCSR merged = shmGatherCSR(local_csr, soa_offsets, rank, nprocs, shm_comm);
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_csr_gather = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // --- Rank 0: Pin mmap'd columns + writable SHM, then run batched GPU ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  // Pin mmap'd read-only columns and writable SHM for DMA H2D transfers.
+  // Same columns as shmPinHostMemory: events, timestamps, end_timestamps,
+  // match_partner, pids, roots, leave_recv_ts.
+  PinRegion cm_pin_regions[8];
+  int cm_n_pin = 0;
+  if (rank == 0) {
+    auto alignPage = [](size_t n) { return (n + 4095) & ~(size_t)4095; };
+    // Read-only mmap columns used by GPU kernels
+    cm_pin_regions[0] = {const_cast<void *>(cm.column_ptrs[ColumnMajorMmap::COL_EVENTS]),
+                         alignPage(total_events * sizeof(event_t))};
+    cm_pin_regions[1] = {const_cast<void *>(cm.column_ptrs[ColumnMajorMmap::COL_TIMESTAMPS]),
+                         alignPage(total_events * sizeof(timestamp_t))};
+    cm_pin_regions[2] = {(void *)((char *)wbase + wlayout.end_timestamps_copy_off),
+                         alignPage(total_events * sizeof(timestamp_t))};
+    cm_pin_regions[3] = {(void *)((char *)wbase + wlayout.match_partner_off),
+                         alignPage(total_events * sizeof(int32_t))};
+    cm_pin_regions[4] = {const_cast<void *>(cm.column_ptrs[ColumnMajorMmap::COL_PIDS]),
+                         alignPage(total_events * sizeof(id_t))};
+    cm_pin_regions[5] = {const_cast<void *>(cm.column_ptrs[ColumnMajorMmap::COL_ROOTS]),
+                         alignPage(total_events * sizeof(id_t))};
+    cm_n_pin = 6;
+    if (cm.hasLeaveRecvTs()) {
+      cm_pin_regions[6] = {const_cast<void *>(cm.column_ptrs[ColumnMajorMmap::COL_LEAVE_RECV_TS]),
+                           alignPage(total_events * sizeof(timestamp_t))};
+      cm_n_pin = 7;
+    }
+
+    size_t total_pin_bytes = 0;
+    for (int i = 0; i < cm_n_pin; i++)
+      total_pin_bytes += cm_pin_regions[i].len;
+
+    const size_t PIN_THRESHOLD = (size_t)10 * 1024 * 1024 * 1024; // 10 GB
+    if (total_pin_bytes > PIN_THRESHOLD) {
+      std::cout << "[ColMajor] Skipping cudaHostRegister: pin size "
+                << (total_pin_bytes / (1024 * 1024))
+                << " MB exceeds 10 GB threshold" << std::endl;
+      cm_n_pin = 0;
+    } else {
+      for (int i = 0; i < cm_n_pin; i++) {
+        cudaError_t err = cudaHostRegister(cm_pin_regions[i].ptr, cm_pin_regions[i].len,
+                                           cudaHostRegisterDefault);
+        if (err != cudaSuccess) {
+          std::cerr << "[ColMajor] Warning: cudaHostRegister failed for region " << i
+                    << " (" << cudaGetErrorString(err) << ")" << std::endl;
+          cudaGetLastError();
+        }
+      }
+      std::cout << "[ColMajor] Pinned " << cm_n_pin << " regions ("
+                << (total_pin_bytes / (1024 * 1024)) << " MB) for DMA H2D" << std::endl;
+    }
+  }
+
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_pin = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  tp0 = std::chrono::high_resolution_clock::now();
+  if (rank == 0) {
+    // Build a ShmSoALayout-compatible structure for GPU batching.
+    // We need the global SoA view that shmRunBatchedGPU expects.
+    // The trick: build a "virtual" layout where read-only columns point to mmap
+    // and writable columns point to the writable SHM window.
+    //
+    // But shmRunBatchedGPU expects a single `base` + `ShmSoALayout`.
+    // Instead, create a custom batched GPU function for the colmajor case.
+
+    RawAnalysisOutput output;
+    int K = computeBatchSize(all_counts, nprocs);
+    int num_batches = (nprocs + K - 1) / K;
+
+    std::cout << "[ColMajor] VRAM batch size K=" << K << ", " << num_batches
+              << " batch(es)" << std::endl;
+
+    // Compute max batch sizes for pool pre-allocation
+    size_t max_batch_events = 0, max_batch_members = 0, max_batch_groups = 0;
+    for (int bs = 0; bs < nprocs; bs += K) {
+      int be = std::min(bs + K, nprocs);
+      size_t bev = soa_offsets[be] - soa_offsets[bs];
+      int bng = merged.group_displs[be] - merged.group_displs[bs];
+      int bnm = merged.member_displs[be] - merged.member_displs[bs];
+      if (bev > max_batch_events) max_batch_events = bev;
+      if ((size_t)bng > max_batch_groups) max_batch_groups = bng;
+      if ((size_t)bnm > max_batch_members) max_batch_members = bnm;
+    }
+
+    GPUMemoryPool pool;
+    pool.allocate(max_batch_events, max_batch_members, max_batch_groups);
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    for (int batch_start = 0; batch_start < nprocs; batch_start += K) {
+      int batch_end = std::min(batch_start + K, nprocs);
+      size_t batch_soa_off = soa_offsets[batch_start];
+      size_t batch_events = soa_offsets[batch_end] - batch_soa_off;
+
+      // Create non-owning TraceDataSoA for this batch
+      TraceDataSoA batch_soa;
+      batch_soa.owns_memory = false;
+      batch_soa.capacity = batch_events;
+      batch_soa.count = batch_events;
+
+      // Read-only from mmap
+      batch_soa.events = const_cast<event_t *>(
+          static_cast<const event_t *>(cm.column_ptrs[ColumnMajorMmap::COL_EVENTS]) + batch_soa_off);
+      batch_soa.types = const_cast<event_type_t *>(
+          static_cast<const event_type_t *>(cm.column_ptrs[ColumnMajorMmap::COL_TYPES]) + batch_soa_off);
+      batch_soa.timestamps = const_cast<timestamp_t *>(
+          static_cast<const timestamp_t *>(cm.column_ptrs[ColumnMajorMmap::COL_TIMESTAMPS]) + batch_soa_off);
+      batch_soa.end_timestamps = (timestamp_t *)(wbase + wlayout.end_timestamps_copy_off) + batch_soa_off;
+      batch_soa.pids = const_cast<id_t *>(
+          static_cast<const id_t *>(cm.column_ptrs[ColumnMajorMmap::COL_PIDS]) + batch_soa_off);
+      batch_soa.roots = const_cast<id_t *>(
+          static_cast<const id_t *>(cm.column_ptrs[ColumnMajorMmap::COL_ROOTS]) + batch_soa_off);
+      batch_soa.match_partner = (int32_t *)(wbase + wlayout.match_partner_off) + batch_soa_off;
+
+      // Writable batch-relative match_partner
+      int32_t *batch_mp = (int32_t *)malloc(batch_events * sizeof(int32_t));
+      for (size_t i = 0; i < batch_events; i++) {
+        int32_t gmp = batch_soa.match_partner[i];
+        if (gmp >= 0) {
+          int32_t local_mp = gmp - (int32_t)batch_soa_off;
+          batch_mp[i] = (local_mp >= 0 && (size_t)local_mp < batch_events) ? local_mp : -1;
+        } else {
+          batch_mp[i] = -1;
+        }
+      }
+      batch_soa.match_partner = batch_mp;
+
+      // Build batch CSR
+      int batch_group_off = merged.group_displs[batch_start];
+      int batch_num_groups = merged.group_displs[batch_end] - batch_group_off;
+      int batch_member_off = merged.member_displs[batch_start];
+      int batch_total_members = merged.member_displs[batch_end] - batch_member_off;
+
+      CollectiveGroupCSR batch_csr;
+      if (batch_num_groups > 0) {
+        batch_csr.num_groups = batch_num_groups;
+        batch_csr.total_members = batch_total_members;
+        batch_csr.offsets = (int32_t *)malloc((batch_num_groups + 1) * sizeof(int32_t));
+        for (int g = 0; g < batch_num_groups; g++)
+          batch_csr.offsets[g] = merged.offsets[batch_group_off + g] - merged.member_displs[batch_start];
+        batch_csr.offsets[batch_num_groups] = batch_total_members;
+        batch_csr.members = (int32_t *)malloc(batch_total_members * sizeof(int32_t));
+        for (int m = 0; m < batch_total_members; m++)
+          batch_csr.members[m] = merged.members[batch_member_off + m] - (int32_t)batch_soa_off;
+        batch_csr.group_types = (event_t *)malloc(batch_num_groups * sizeof(event_t));
+        for (int g = 0; g < batch_num_groups; g++)
+          batch_csr.group_types[g] = (event_t)merged.group_types[batch_group_off + g];
+        batch_csr.group_roots = (id_t *)malloc(batch_num_groups * sizeof(id_t));
+        memcpy(batch_csr.group_roots, &merged.group_roots[batch_group_off],
+               batch_num_groups * sizeof(id_t));
+        batch_csr.member_bytes_sent = (uint64_t *)malloc(batch_total_members * sizeof(uint64_t));
+        memcpy(batch_csr.member_bytes_sent, &merged.member_bytes_sent[batch_member_off],
+               batch_total_members * sizeof(uint64_t));
+        batch_csr.member_bytes_received = (uint64_t *)malloc(batch_total_members * sizeof(uint64_t));
+        memcpy(batch_csr.member_bytes_received, &merged.member_bytes_received[batch_member_off],
+               batch_total_members * sizeof(uint64_t));
+      }
+
+      // leave_recv_ts
+      const timestamp_t *batch_lrt = nullptr;
+      if (cm.hasLeaveRecvTs())
+        batch_lrt = static_cast<const timestamp_t *>(cm.column_ptrs[ColumnMajorMmap::COL_LEAVE_RECV_TS]) + batch_soa_off;
+
+#ifdef USE_SCALASCA_TIMESTAMPS
+      RawAnalysisOutput batch_raw = runAnalysisKernelsAsync(batch_soa, batch_csr, pool, stream, batch_lrt);
+#else
+      RawAnalysisOutput batch_raw = runAnalysisKernelsAsync(batch_soa, batch_csr, pool, stream);
+#endif
+
+      accumulateResults(output, batch_raw);
+
+      free(batch_mp);
+      batch_soa.match_partner = nullptr;
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    pool.deallocate();
+    result.raw = std::move(output);
+  }
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_gpu_batches = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // --- Cleanup ---
+  tp0 = std::chrono::high_resolution_clock::now();
+  // Unpin mmap'd regions before closing mmap
+  if (rank == 0 && cm_n_pin > 0) {
+    for (int i = 0; i < cm_n_pin; i++)
+      cudaHostUnregister(cm_pin_regions[i].ptr);
+  }
+  local_data.deallocate();
+  MPI_Win_free(&wwin);
+  MPI_Comm_free(&shm_comm);
+  // Close the mmap
+  delete phase1.colmajor_mmap;
+  phase1.colmajor_mmap = nullptr;
+  tp1 = std::chrono::high_resolution_clock::now();
+  t_cleanup = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // Timing
+  result.preprocess_ms = t_setup + t_writable_alloc + t_fill + t_p2p + t_coll +
+                         t_ts_correct + t_remap_fence + t_csr_gather;
+  result.gpu_analysis_ms = t_pin + t_gpu_batches;
+  result.cleanup_ms = t_cleanup;
+
+  if (rank == 0) {
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "[ColMajor Preprocess] setup:          " << t_setup << " ms" << std::endl;
+    std::cout << "[ColMajor Preprocess] writable_alloc: " << t_writable_alloc << " ms" << std::endl;
+    std::cout << "[ColMajor Preprocess] fill(mmap):     " << t_fill << " ms" << std::endl;
+    std::cout << "[ColMajor Preprocess] p2p_matching:   " << t_p2p << " ms" << std::endl;
+    std::cout << "[ColMajor Preprocess] coll_grouping:  " << t_coll << " ms" << std::endl;
+    std::cout << "[ColMajor Preprocess] ts_correction:  " << t_ts_correct << " ms" << std::endl;
+    std::cout << "[ColMajor Preprocess] remap+fence:    " << t_remap_fence << " ms" << std::endl;
+    std::cout << "[ColMajor Preprocess] csr_gather:     " << t_csr_gather << " ms" << std::endl;
+    std::cout << "[ColMajor GPU]        pin:            " << t_pin << " ms" << std::endl;
+    std::cout << "[ColMajor GPU]        batches:        " << t_gpu_batches << " ms" << std::endl;
+    std::cout << "[ColMajor Cleanup]    cleanup:        " << t_cleanup << " ms" << std::endl;
+  }
+
+  return result;
+}
+
 // Direct-to-shared-memory analysis: reads OTF2 vectors directly into shared
 // window, then runs P2P matching, collective grouping, and timestamp correction
 // on the shared data before GPU analysis. Eliminates double memory allocation.
@@ -1319,9 +1790,19 @@ int main(int argc, char **argv) {
     raw = runAnalysisKernels(local_data, csr);
 #endif
   } else {
-    // Multi-rank: direct-to-shared-memory analysis
-    ShmAnalysisResult shm_result =
-        sharedMemoryDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct);
+    // Multi-rank: use column-major mmap path if available, else SHM path
+    ShmAnalysisResult shm_result;
+    if (phase1.colmajor_mmap != nullptr) {
+      shm_result = colmajorDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct);
+      // If colmajor returned empty (multi-node fallback), use SHM path
+      if (shm_result.preprocess_ms == 0 && shm_result.gpu_analysis_ms == 0 &&
+          phase1.colmajor_mmap == nullptr) {
+        // colmajor path cleaned up the mmap and returned empty — use SHM
+        shm_result = sharedMemoryDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct);
+      }
+    } else {
+      shm_result = sharedMemoryDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct);
+    }
     raw = std::move(shm_result.raw);
     preprocess_ms = shm_result.preprocess_ms;
     gpu_analysis_ms = shm_result.gpu_analysis_ms;
