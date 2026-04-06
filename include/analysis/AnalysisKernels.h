@@ -40,6 +40,7 @@ struct GPUMemoryPool {
   event_t *d_events = nullptr;
   timestamp_t *d_timestamps = nullptr;
   timestamp_t *d_end_timestamps = nullptr;
+  timestamp_t *d_leave_recv_ts = nullptr;
   int32_t *d_match = nullptr;
   id_t *d_pids = nullptr;
   id_t *d_roots = nullptr;
@@ -77,12 +78,14 @@ struct GPUMemoryPool {
 };
 
 RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
-                                     const CollectiveGroupCSR &csr);
+                                     const CollectiveGroupCSR &csr,
+                                     const timestamp_t *leave_recv_ts = nullptr);
 
 // Stream-based variant: uses pre-allocated GPU memory pool and a specific stream
 RawAnalysisOutput runAnalysisKernelsAsync(const TraceDataSoA &data,
                                           const CollectiveGroupCSR &csr,
                                           GPUMemoryPool &pool,
-                                          cudaStream_t stream);
+                                          cudaStream_t stream,
+                                          const timestamp_t *leave_recv_ts = nullptr);
 
 #endif // GPU_ANALYZER_ANALYSIS_KERNELS_H

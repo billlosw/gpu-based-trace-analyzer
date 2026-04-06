@@ -380,7 +380,7 @@ The read throughput is approximately 55-65 MB/s, far below the NVMe SSD capabili
 
 ---
 
-### TODO 22: Crash on Large Traces (n4096+) During Collective Redistribution
+### ~~TODO 22: Crash on Large Traces (n4096+) During Collective Redistribution~~ [FIXED 2026-04-04]
 
 **Issue**: The GPU analyzer crashes with `std::length_error: vector::_M_default_append` when processing the NPB CG n4096 trace (41GB, 4096 ranks) with 64 MPI reader ranks on fuse2 (251GB RAM).
 
@@ -412,7 +412,7 @@ srun -N 1 -n 64 -w fuse2 -p Long --gres=gpu:5090:1 ./build/gpu_analyzer /home/lu
 3. For flat_comm_sets: instead of flattening the full communicator member list for each event, use a communicator ID and maintain a separate communicator-to-members mapping (deduplication)
 4. Process redistributions in chunks to bound peak memory per target
 
-**Priority**: High (blocks analysis of large-scale traces).
+**Priority**: Fixed. Changed all counts/displacements in `redistributeCollectives` from `int` to `int64_t`. Added `safeGatherv<T>()` helper that uses MPI_Gatherv when data fits in int, falls back to chunked MPI_Send/MPI_Recv otherwise. Also fixed `int` overflow in main.cu event count accumulators.
 
 ---
 

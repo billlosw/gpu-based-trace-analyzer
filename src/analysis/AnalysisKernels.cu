@@ -12,6 +12,7 @@ __global__ void
 kernelLateSenderReceiver(const event_t *__restrict__ events,
                          const timestamp_t *__restrict__ timestamps,
                          const timestamp_t *__restrict__ end_timestamps,
+                         const timestamp_t *__restrict__ leave_recv_ts,
                          const int32_t *__restrict__ match_partner, size_t n,
                          double *__restrict__ late_sender_out,
                          unsigned int *__restrict__ late_sender_cnt,
@@ -34,10 +35,16 @@ kernelLateSenderReceiver(const event_t *__restrict__ events,
 
     // Late sender: sender arrived after receiver started waiting.
     // Scalasca: idle = min(Enter(MPI_Send), Leave(MPI_Recv/Wait)) - Enter(MPI_Recv/Wait)
-    // Simplified: idle = Enter(MPI_Send) - Enter(MPI_Recv/Wait) when > 0
-    if (send_enter > recv_enter) {
-      unsigned int pos = atomicAdd(late_sender_cnt, 1u);
-      late_sender_out[pos] = (double)(send_enter - recv_enter);
+    // Clock condition: clamp send_enter by leave_recv to handle violations.
+    {
+      timestamp_t max_time = send_enter;
+      timestamp_t leave_recv = leave_recv_ts[i];
+      if (leave_recv > 0 && max_time > leave_recv)
+        max_time = leave_recv;
+      if (max_time > recv_enter) {
+        unsigned int pos = atomicAdd(late_sender_cnt, 1u);
+        late_sender_out[pos] = (double)(max_time - recv_enter);
+      }
     }
 
 #ifdef USE_SCALASCA_TIMESTAMPS
@@ -311,7 +318,8 @@ __global__ void kernelNxNWaitCompletion(
 // Host function: Run all 8 analyses on GPU
 // ============================================================
 RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
-                                     const CollectiveGroupCSR &csr) {
+                                     const CollectiveGroupCSR &csr,
+                                     const timestamp_t *leave_recv_ts) {
   RawAnalysisOutput output;
   size_t n = data.count;
   if (n == 0)
@@ -331,13 +339,14 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
 
   // ---- Allocate device arrays for trace data ----
   event_t *d_events;
-  timestamp_t *d_timestamps, *d_end_timestamps;
+  timestamp_t *d_timestamps, *d_end_timestamps, *d_leave_recv;
   int32_t *d_match;
   id_t *d_pids, *d_roots;
 
   CUDA_CHECK(cudaMalloc(&d_events, n * sizeof(event_t)));
   CUDA_CHECK(cudaMalloc(&d_timestamps, n * sizeof(timestamp_t)));
   CUDA_CHECK(cudaMalloc(&d_end_timestamps, n * sizeof(timestamp_t)));
+  CUDA_CHECK(cudaMalloc(&d_leave_recv, n * sizeof(timestamp_t)));
   CUDA_CHECK(cudaMalloc(&d_match, n * sizeof(int32_t)));
   CUDA_CHECK(cudaMalloc(&d_pids, n * sizeof(id_t)));
   CUDA_CHECK(cudaMalloc(&d_roots, n * sizeof(id_t)));
@@ -350,6 +359,12 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
                          n * sizeof(timestamp_t), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_end_timestamps, data.end_timestamps,
                          n * sizeof(timestamp_t), cudaMemcpyHostToDevice));
+  if (leave_recv_ts) {
+    CUDA_CHECK(cudaMemcpy(d_leave_recv, leave_recv_ts,
+                           n * sizeof(timestamp_t), cudaMemcpyHostToDevice));
+  } else {
+    CUDA_CHECK(cudaMemset(d_leave_recv, 0, n * sizeof(timestamp_t)));
+  }
   CUDA_CHECK(cudaMemcpy(d_match, data.match_partner, n * sizeof(int32_t),
                          cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_pids, data.pids, n * sizeof(id_t),
@@ -374,7 +389,7 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   int blockSize = 256;
   int gridSize = (int)std::min((n + 255) / 256, (size_t)1024);
   kernelLateSenderReceiver<<<gridSize, blockSize>>>(
-      d_events, d_timestamps, d_end_timestamps, d_match, n, d_ls_out, d_ls_cnt, d_lr_out,
+      d_events, d_timestamps, d_end_timestamps, d_leave_recv, d_match, n, d_ls_out, d_ls_cnt, d_lr_out,
       d_lr_cnt);
   CUDA_CHECK(cudaEventRecord(ev_p2p_done));
   CUDA_CHECK(cudaDeviceSynchronize());
@@ -565,6 +580,7 @@ RawAnalysisOutput runAnalysisKernels(const TraceDataSoA &data,
   CUDA_CHECK(cudaFree(d_events));
   CUDA_CHECK(cudaFree(d_timestamps));
   CUDA_CHECK(cudaFree(d_end_timestamps));
+  CUDA_CHECK(cudaFree(d_leave_recv));
   CUDA_CHECK(cudaFree(d_match));
   CUDA_CHECK(cudaFree(d_pids));
   CUDA_CHECK(cudaFree(d_roots));
@@ -605,6 +621,7 @@ void GPUMemoryPool::allocate(size_t max_n, size_t max_members, size_t max_groups
   CUDA_CHECK(cudaMalloc(&d_events, max_n * sizeof(event_t)));
   CUDA_CHECK(cudaMalloc(&d_timestamps, max_n * sizeof(timestamp_t)));
   CUDA_CHECK(cudaMalloc(&d_end_timestamps, max_n * sizeof(timestamp_t)));
+  CUDA_CHECK(cudaMalloc(&d_leave_recv_ts, max_n * sizeof(timestamp_t)));
   CUDA_CHECK(cudaMalloc(&d_match, max_n * sizeof(int32_t)));
   CUDA_CHECK(cudaMalloc(&d_pids, max_n * sizeof(id_t)));
   CUDA_CHECK(cudaMalloc(&d_roots, max_n * sizeof(id_t)));
@@ -644,6 +661,7 @@ void GPUMemoryPool::deallocate() {
   if (max_events == 0) return;
 
   cudaFree(d_events); cudaFree(d_timestamps); cudaFree(d_end_timestamps);
+  cudaFree(d_leave_recv_ts);
   cudaFree(d_match); cudaFree(d_pids); cudaFree(d_roots);
   cudaFree(d_ls_out); cudaFree(d_lr_out);
   cudaFree(d_ls_cnt); cudaFree(d_lr_cnt);
@@ -661,6 +679,7 @@ void GPUMemoryPool::deallocate() {
   }
 
   d_events = nullptr; d_timestamps = nullptr; d_end_timestamps = nullptr;
+  d_leave_recv_ts = nullptr;
   d_match = nullptr; d_pids = nullptr; d_roots = nullptr;
   d_ls_out = nullptr; d_lr_out = nullptr;
   d_ls_cnt = nullptr; d_lr_cnt = nullptr;
@@ -682,7 +701,8 @@ void GPUMemoryPool::deallocate() {
 RawAnalysisOutput runAnalysisKernelsAsync(const TraceDataSoA &data,
                                           const CollectiveGroupCSR &csr,
                                           GPUMemoryPool &pool,
-                                          cudaStream_t stream) {
+                                          cudaStream_t stream,
+                                          const timestamp_t *leave_recv_ts) {
   RawAnalysisOutput output;
   size_t n = data.count;
   if (n == 0) return output;
@@ -710,6 +730,12 @@ RawAnalysisOutput runAnalysisKernelsAsync(const TraceDataSoA &data,
                               cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(pool.d_roots, data.roots, n * sizeof(id_t),
                               cudaMemcpyHostToDevice, stream));
+  if (leave_recv_ts) {
+    CUDA_CHECK(cudaMemcpyAsync(pool.d_leave_recv_ts, leave_recv_ts,
+                                n * sizeof(timestamp_t), cudaMemcpyHostToDevice, stream));
+  } else {
+    CUDA_CHECK(cudaMemsetAsync(pool.d_leave_recv_ts, 0, n * sizeof(timestamp_t), stream));
+  }
 
   CUDA_CHECK(cudaEventRecord(ev_h2d_done, stream));
 
@@ -721,8 +747,8 @@ RawAnalysisOutput runAnalysisKernelsAsync(const TraceDataSoA &data,
   int blockSize = 256;
   int gridSize = (int)std::min((n + 255) / 256, (size_t)1024);
   kernelLateSenderReceiver<<<gridSize, blockSize, 0, stream>>>(
-      pool.d_events, pool.d_timestamps, pool.d_end_timestamps, pool.d_match,
-      n, pool.d_ls_out, pool.d_ls_cnt, pool.d_lr_out, pool.d_lr_cnt);
+      pool.d_events, pool.d_timestamps, pool.d_end_timestamps, pool.d_leave_recv_ts,
+      pool.d_match, n, pool.d_ls_out, pool.d_ls_cnt, pool.d_lr_out, pool.d_lr_cnt);
   CUDA_CHECK(cudaEventRecord(ev_p2p_done, stream));
 
   // Sync stream to read P2P counts for D2H sizing

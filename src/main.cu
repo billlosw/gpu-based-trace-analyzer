@@ -398,10 +398,17 @@ streamBatchAnalysis(TraceDataSoA &local_data, CollectiveGroupCSR &local_csr,
   RawAnalysisOutput output;
 
   // All ranks participate: gather event counts to rank 0
-  int local_count = (int)local_data.count;
+  int64_t local_count_64 = (int64_t)local_data.count;
+  std::vector<int64_t> all_counts_64(nprocs);
+  MPI_Gather(&local_count_64, 1, MPI_INT64_T, all_counts_64.data(), 1,
+             MPI_INT64_T, 0, MPI_COMM_WORLD);
+
+  // Convert to int for downstream (per-rank counts fit in int)
   std::vector<int> all_counts(nprocs);
-  MPI_Gather(&local_count, 1, MPI_INT, all_counts.data(), 1, MPI_INT, 0,
-             MPI_COMM_WORLD);
+  if (rank == 0) {
+    for (int i = 0; i < nprocs; i++)
+      all_counts[i] = (int)all_counts_64[i];
+  }
 
   if (rank != 0) {
     // Non-zero ranks: send data to rank 0, then done
@@ -411,7 +418,7 @@ streamBatchAnalysis(TraceDataSoA &local_data, CollectiveGroupCSR &local_csr,
 
   // ---- Rank 0 only below ----
   int K = computeBatchSize(all_counts, nprocs);
-  int total_events = 0;
+  int64_t total_events = 0;
   for (int i = 0; i < nprocs; i++)
     total_events += all_counts[i];
   int num_batches = (nprocs + K - 1) / K;
@@ -488,6 +495,7 @@ struct ShmSoALayout {
   size_t pids_off, tids_off, replay_pids_off;
   size_t srcs_off, dsts_off, tags_off, roots_off, indices_off;
   size_t match_partner_off, coll_group_id_off;
+  size_t leave_recv_ts_off;
 
   // Page-align offsets so each sub-array can be independently pinned
   // with cudaHostRegister (requires page-aligned ptr and size).
@@ -512,6 +520,7 @@ struct ShmSoALayout {
     indices_off = off;        off += alignPage(n * sizeof(id_t));
     match_partner_off = off;  off += alignPage(n * sizeof(int32_t));
     coll_group_id_off = off;  off += alignPage(n * sizeof(int32_t));
+    leave_recv_ts_off = off;  off += alignPage(n * sizeof(timestamp_t));
     total_bytes = off;
   }
 };
@@ -548,7 +557,7 @@ static void shmSetupLocalSoA(TraceDataSoA &soa, char *base,
   soa.coll_group_id = (int32_t *)(base + layout.coll_group_id_off) + offset;
 }
 
-// Pin the 6 GPU-accessed SoA arrays for DMA H2D transfers.
+// Pin the 7 GPU-accessed SoA arrays for DMA H2D transfers.
 // Returns the number of pinned regions (0 if skipped or failed).
 struct PinRegion {
   void *ptr;
@@ -558,7 +567,7 @@ static int shmPinHostMemory(char *base, const ShmSoALayout &layout,
                             size_t total_events, PinRegion *regions,
                             int max_regions) {
   const size_t PIN_THRESHOLD = (size_t)10 * 1024 * 1024 * 1024; // 10 GB
-  if (total_events == 0 || max_regions < 6)
+  if (total_events == 0 || max_regions < 7)
     return 0;
 
   regions[0] = {base + layout.events_off,
@@ -573,7 +582,9 @@ static int shmPinHostMemory(char *base, const ShmSoALayout &layout,
                 ShmSoALayout::alignPage(total_events * sizeof(id_t))};
   regions[5] = {base + layout.roots_off,
                 ShmSoALayout::alignPage(total_events * sizeof(id_t))};
-  int n_pin = 6;
+  regions[6] = {base + layout.leave_recv_ts_off,
+                ShmSoALayout::alignPage(total_events * sizeof(timestamp_t))};
+  int n_pin = 7;
 
   size_t total_pin_bytes = 0;
   for (int i = 0; i < n_pin; i++)
@@ -841,7 +852,7 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
     // --- Per-batch pinning (only if global pinning was skipped) ---
     auto tp_pin0 = std::chrono::high_resolution_clock::now();
     int batch_n_pin = 0;
-    PinRegion batch_pin[6];
+    PinRegion batch_pin[7];
     if (!global_pinned && batch_events > 0) {
       size_t ev_bytes = batch_events * sizeof(event_t);
       size_t ts_bytes = batch_events * sizeof(timestamp_t);
@@ -854,9 +865,10 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
       batch_pin[3] = {batch_mp, mp_bytes};
       batch_pin[4] = {batch_soa.pids, id_bytes};
       batch_pin[5] = {batch_soa.roots, id_bytes};
-      batch_n_pin = 6;
+      batch_pin[6] = {(void *)((timestamp_t *)(base + layout.leave_recv_ts_off) + batch_soa_off), ts_bytes};
+      batch_n_pin = 7;
 
-      size_t pin_total = ev_bytes + 2 * ts_bytes + mp_bytes + 2 * id_bytes;
+      size_t pin_total = ev_bytes + 3 * ts_bytes + mp_bytes + 2 * id_bytes;
       bool pin_ok = true;
       for (int i = 0; i < batch_n_pin; i++) {
         cudaError_t err = cudaHostRegister(batch_pin[i].ptr, batch_pin[i].len,
@@ -880,7 +892,13 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
     float batch_pin_ms = (float)std::chrono::duration<double, std::milli>(tp_pin1 - tp_pin0).count();
 
     // --- Run GPU kernels (using pool + stream) ---
+#ifdef USE_SCALASCA_TIMESTAMPS
+    const timestamp_t *batch_leave_recv =
+        (const timestamp_t *)(base + layout.leave_recv_ts_off) + batch_soa_off;
+    RawAnalysisOutput batch_raw = runAnalysisKernelsAsync(batch_soa, batch_csr, pool, stream, batch_leave_recv);
+#else
     RawAnalysisOutput batch_raw = runAnalysisKernelsAsync(batch_soa, batch_csr, pool, stream);
+#endif
 
     // --- Per-batch unpinning ---
     auto tp_unpin0 = std::chrono::high_resolution_clock::now();
@@ -968,10 +986,15 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
 
   // --- Exchange event counts, compute offsets ---
   tp0 = std::chrono::high_resolution_clock::now();
-  int local_count = (int)phase1.event_count;
+  int64_t local_count_64 = (int64_t)phase1.event_count;
+  std::vector<int64_t> all_counts_64(nprocs);
+  MPI_Allgather(&local_count_64, 1, MPI_INT64_T, all_counts_64.data(), 1,
+                MPI_INT64_T, shm_comm);
+
+  // Convert to int for downstream APIs that need int (per-rank counts safely fit)
   std::vector<int> all_counts(nprocs);
-  MPI_Allgather(&local_count, 1, MPI_INT, all_counts.data(), 1, MPI_INT,
-                shm_comm);
+  for (int i = 0; i < nprocs; i++)
+    all_counts[i] = (int)all_counts_64[i];
 
   std::vector<size_t> soa_offsets(nprocs + 1);
   size_t total_events = 0;
@@ -1023,7 +1046,7 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   // Also request huge pages (2MB THP) to reduce TLB miss rate.
   // Pinning is done by rank 0 after all ranks finish prefaulting.
   tp0 = std::chrono::high_resolution_clock::now();
-  PinRegion pin_regions[6];
+  PinRegion pin_regions[7];
   int n_pin = 0;
   {
     // Rank 0 requests huge pages for the entire buffer
@@ -1049,13 +1072,14 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
       memset((id_t *)(base + layout.indices_off) + my_off, 0, my_cnt * sizeof(id_t));
       memset((int32_t *)(base + layout.match_partner_off) + my_off, 0, my_cnt * sizeof(int32_t));
       memset((int32_t *)(base + layout.coll_group_id_off) + my_off, 0, my_cnt * sizeof(int32_t));
+      memset((timestamp_t *)(base + layout.leave_recv_ts_off) + my_off, 0, my_cnt * sizeof(timestamp_t));
     }
 
     MPI_Barrier(shm_comm);
 
     // Rank 0 pins after all pages are faulted (hot pages → fast pin)
     if (rank == 0)
-      n_pin = shmPinHostMemory(base, layout, total_events, pin_regions, 6);
+      n_pin = shmPinHostMemory(base, layout, total_events, pin_regions, 7);
     MPI_Barrier(shm_comm);
   }
   tp1 = std::chrono::high_resolution_clock::now();
@@ -1072,6 +1096,15 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   shmSetupLocalSoA(local_data, base, layout, my_off, my_cnt);
 
   readerFillSoA(phase1.handle, local_data);
+#ifdef USE_SCALASCA_TIMESTAMPS
+  // Copy leave_recv_ts into shared window before releasing reader
+  {
+    std::vector<timestamp_t> lrt = readerGetLeaveRecvTs(phase1.handle);
+    timestamp_t *shm_lrt = (timestamp_t *)(base + layout.leave_recv_ts_off) + my_off;
+    if (my_cnt > 0 && lrt.size() == my_cnt)
+      memcpy(shm_lrt, lrt.data(), my_cnt * sizeof(timestamp_t));
+  }
+#endif
   readerRelease(phase1.handle);
   phase1.handle = nullptr;
   tp1 = std::chrono::high_resolution_clock::now();
@@ -1266,6 +1299,9 @@ int main(int argc, char **argv) {
     TraceDataSoA local_data;
     local_data.allocate(phase1.event_count);
     readerFillSoA(phase1.handle, local_data);
+#ifdef USE_SCALASCA_TIMESTAMPS
+    std::vector<timestamp_t> leave_recv_ts = readerGetLeaveRecvTs(phase1.handle);
+#endif
     readerRelease(phase1.handle);
     phase1.handle = nullptr;
 
@@ -1277,7 +1313,11 @@ int main(int argc, char **argv) {
       applyTimestampCorrection(local_data);
 #endif
 
+#ifdef USE_SCALASCA_TIMESTAMPS
+    raw = runAnalysisKernels(local_data, csr, leave_recv_ts.data());
+#else
     raw = runAnalysisKernels(local_data, csr);
+#endif
   } else {
     // Multi-rank: direct-to-shared-memory analysis
     ShmAnalysisResult shm_result =

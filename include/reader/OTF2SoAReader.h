@@ -1,6 +1,7 @@
 #ifndef GPU_ANALYZER_OTF2_SOA_READER_H
 #define GPU_ANALYZER_OTF2_SOA_READER_H
 
+#include "common/types.h"
 #include "data/TraceDataSoA.h"
 #include <string>
 #include <vector>
@@ -39,6 +40,12 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path);
 // Initializes: match_partner=-1, coll_group_id=-1, tids=0, indices[i]=i,
 // replay_pids=pids. Does NOT call data.allocate().
 void readerFillSoA(void *handle, TraceDataSoA &data);
+
+// Get Leave(MPI_Recv/Wait) timestamps per event (for clock clamping).
+// Must be called before readerRelease. Moves the internal vector out.
+#ifdef USE_SCALASCA_TIMESTAMPS
+std::vector<timestamp_t> readerGetLeaveRecvTs(void *handle);
+#endif
 
 // Free the opaque handle. Must be called exactly once after readerFillSoA.
 void readerRelease(void *handle);

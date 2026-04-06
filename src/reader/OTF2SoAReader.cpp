@@ -1,6 +1,9 @@
 #include "reader/OTF2SoAReader.h"
 
+#include <algorithm>
 #include <chrono>
+#include <climits>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <tuple>
@@ -142,6 +145,12 @@ public:
       m_v_end_timestamps[it->second] = m_last_leave_ts[pid];
       it->second = -1;
     }
+    // Record Leave(MPI_Recv/Wait) for recv events (clock clamping)
+    auto rit = m_last_recv_soa_idx.find(pid);
+    if (rit != m_last_recv_soa_idx.end() && rit->second >= 0) {
+      m_v_leave_recv_ts[rit->second] = m_last_leave_ts[pid];
+      rit->second = -1;
+    }
   }
 #endif
 
@@ -183,6 +192,7 @@ public:
     timestamp_t enter_ts = (it != m_last_enter_ts.end())
                                ? it->second
                                : extractTimestamp(event.timestamp());
+    m_last_recv_soa_idx[pid] = (int64_t)m_v_events.size();
     pushEvent(TT_MPI_Recv, ENTER, enter_ts, enter_ts, pid, event.sender(), pid,
               event.msg_tag(), 0);
 #else
@@ -253,6 +263,7 @@ public:
         (it2 != m_irecv_enter_ts.end()) ? it2->second : enter_ts;
     if (it2 != m_irecv_enter_ts.end())
       m_irecv_enter_ts.erase(it2);
+    m_last_recv_soa_idx[pid] = (int64_t)m_v_events.size();
     pushEvent(TT_MPI_Irecv, ENTER, enter_ts, irecv_enter_ts, pid,
               event.sender(), pid, event.msg_tag(), 0);
 #else
@@ -424,6 +435,9 @@ public:
   std::vector<std::vector<uint64_t>> &getCommSets() { return m_comm_sets; }
   std::vector<uint64_t> &getCollBytesSent() { return m_coll_bytes_sent; }
   std::vector<uint64_t> &getCollBytesReceived() { return m_coll_bytes_received; }
+#ifdef USE_SCALASCA_TIMESTAMPS
+  std::vector<timestamp_t> &getLeaveRecvTs() { return m_v_leave_recv_ts; }
+#endif
 
   // Append received collective events after redistribution
   void appendCollectiveEvents(const std::vector<int> &recv_op_types,
@@ -486,6 +500,8 @@ private:
   std::unordered_map<std::pair<id_t, uint64_t>, timestamp_t, PairHash> m_irecv_enter_ts;
   std::unordered_map<id_t, timestamp_t> m_last_leave_ts;
   std::unordered_map<id_t, int64_t> m_last_send_soa_idx;
+  std::unordered_map<id_t, int64_t> m_last_recv_soa_idx;
+  std::vector<timestamp_t> m_v_leave_recv_ts;  // Leave(MPI_Recv/Wait) per event
 #endif
 
   size_t m_send_count = 0;
@@ -508,26 +524,96 @@ private:
     m_v_dsts.push_back(dst);
     m_v_tags.push_back(tag);
     m_v_roots.push_back(root);
+#ifdef USE_SCALASCA_TIMESTAMPS
+    m_v_leave_recv_ts.push_back(0);  // filled later by Leave handler for recvs
+#endif
   }
 };
 
 // ============================================================
 // Collective redistribution via MPI
 // ============================================================
+// Helper: safe MPI_Gatherv that falls back to point-to-point Send/Recv
+// when total data exceeds INT_MAX (MPI count/displacement limit).
+template <typename T>
+static void safeGatherv(const T *sendbuf, int64_t sendcount,
+                        MPI_Datatype dtype, T *recvbuf,
+                        const std::vector<int64_t> &recv_counts,
+                        const std::vector<int64_t> &displs, int root,
+                        int rank, int nprocs, MPI_Comm comm) {
+  // Check if any displacement or count exceeds INT_MAX
+  bool needs_p2p = (sendcount > INT_MAX);
+  if (rank == root) {
+    for (int i = 0; i < nprocs; i++) {
+      if (recv_counts[i] > INT_MAX || displs[i] > INT_MAX) {
+        needs_p2p = true;
+        break;
+      }
+    }
+  }
+  // Broadcast the decision from root
+  int use_p2p = needs_p2p ? 1 : 0;
+  MPI_Bcast(&use_p2p, 1, MPI_INT, root, comm);
+
+  if (!use_p2p) {
+    // Standard MPI_Gatherv (all fits in int)
+    std::vector<int> rc_int(nprocs), dp_int(nprocs);
+    if (rank == root) {
+      for (int i = 0; i < nprocs; i++) {
+        rc_int[i] = (int)recv_counts[i];
+        dp_int[i] = (int)displs[i];
+      }
+    }
+    MPI_Gatherv(sendbuf, (int)sendcount, dtype,
+                recvbuf, rc_int.data(), dp_int.data(), dtype, root, comm);
+  } else {
+    // Fallback: point-to-point for large data
+    if (rank == root) {
+      // Copy local data
+      if (sendcount > 0)
+        memcpy(recvbuf + displs[root], sendbuf, sendcount * sizeof(T));
+      // Receive from others
+      for (int i = 0; i < nprocs; i++) {
+        if (i == root || recv_counts[i] == 0) continue;
+        // Receive in chunks of INT_MAX
+        int64_t remaining = recv_counts[i];
+        int64_t offset = 0;
+        while (remaining > 0) {
+          int chunk = (int)std::min(remaining, (int64_t)INT_MAX);
+          MPI_Recv(recvbuf + displs[i] + offset, chunk, dtype, i,
+                   /*tag=*/0, comm, MPI_STATUS_IGNORE);
+          offset += chunk;
+          remaining -= chunk;
+        }
+      }
+    } else {
+      // Send in chunks of INT_MAX
+      int64_t remaining = sendcount;
+      int64_t offset = 0;
+      while (remaining > 0) {
+        int chunk = (int)std::min(remaining, (int64_t)INT_MAX);
+        MPI_Send(sendbuf + offset, chunk, dtype, root, /*tag=*/0, comm);
+        offset += chunk;
+        remaining -= chunk;
+      }
+    }
+  }
+}
+
 static void redistributeCollectives(Pass2DataCallback &cb,
                                     CollRedistBuffers &redist, int rank,
                                     int nprocs) {
   for (int target = 0; target < nprocs; target++) {
-    int local_count = (int)redist.pids[target].size();
+    int64_t local_count_64 = (int64_t)redist.pids[target].size();
 
-    // Gather event counts to target rank
-    std::vector<int> recv_counts(nprocs);
-    MPI_Gather(&local_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT,
-               target, MPI_COMM_WORLD);
+    // Gather event counts to target rank (each per-rank count fits in int64)
+    std::vector<int64_t> recv_counts(nprocs);
+    MPI_Gather(&local_count_64, 1, MPI_INT64_T, recv_counts.data(), 1,
+               MPI_INT64_T, target, MPI_COMM_WORLD);
 
-    // Compute displacements on target rank
-    std::vector<int> displs(nprocs);
-    int total = 0;
+    // Compute displacements on target rank (int64 to avoid overflow)
+    std::vector<int64_t> displs(nprocs);
+    int64_t total = 0;
     if (rank == target) {
       for (int i = 0; i < nprocs; i++) {
         displs[i] = total;
@@ -536,11 +622,13 @@ static void redistributeCollectives(Pass2DataCallback &cb,
     }
 
     // Skip if no data to transfer for this target
-    int global_total = 0;
-    MPI_Allreduce(&local_count, &global_total, 1, MPI_INT, MPI_SUM,
+    int64_t global_total = 0;
+    MPI_Allreduce(&local_count_64, &global_total, 1, MPI_INT64_T, MPI_SUM,
                   MPI_COMM_WORLD);
     if (global_total == 0)
       continue;
+
+    int local_count = (int)local_count_64; // per-rank count always fits in int
 
     // Allocate receive buffers on target rank
     std::vector<int> g_op_types;
@@ -557,41 +645,37 @@ static void redistributeCollectives(Pass2DataCallback &cb,
       g_bytes_received.resize(total);
     }
 
-    // Gatherv fixed-length arrays
-    MPI_Gatherv(redist.op_types[target].data(), local_count, MPI_INT,
+    // Gatherv fixed-length arrays (per-rank counts fit in int, use safeGatherv
+    // for displacements that might exceed INT_MAX)
+    safeGatherv(redist.op_types[target].data(), local_count_64, MPI_INT,
                 rank == target ? g_op_types.data() : nullptr,
-                recv_counts.data(), displs.data(), MPI_INT, target,
-                MPI_COMM_WORLD);
-    MPI_Gatherv(redist.begin_ts[target].data(), local_count, MPI_UINT64_T,
-                rank == target ? (uint64_t *)g_begin_ts.data() : nullptr,
-                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
-                MPI_COMM_WORLD);
-    MPI_Gatherv(redist.end_ts[target].data(), local_count, MPI_UINT64_T,
-                rank == target ? (uint64_t *)g_end_ts.data() : nullptr,
-                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
-                MPI_COMM_WORLD);
-    MPI_Gatherv(redist.roots[target].data(), local_count, MPI_UINT32_T,
-                rank == target ? g_roots.data() : nullptr, recv_counts.data(),
-                displs.data(), MPI_UINT32_T, target, MPI_COMM_WORLD);
-    MPI_Gatherv(redist.pids[target].data(), local_count, MPI_UINT32_T,
-                rank == target ? g_pids.data() : nullptr, recv_counts.data(),
-                displs.data(), MPI_UINT32_T, target, MPI_COMM_WORLD);
-    MPI_Gatherv(redist.bytes_sent[target].data(), local_count, MPI_UINT64_T,
+                recv_counts, displs, target, rank, nprocs, MPI_COMM_WORLD);
+    safeGatherv(redist.begin_ts[target].data(), local_count_64, MPI_UINT64_T,
+                rank == target ? g_begin_ts.data() : nullptr,
+                recv_counts, displs, target, rank, nprocs, MPI_COMM_WORLD);
+    safeGatherv(redist.end_ts[target].data(), local_count_64, MPI_UINT64_T,
+                rank == target ? g_end_ts.data() : nullptr,
+                recv_counts, displs, target, rank, nprocs, MPI_COMM_WORLD);
+    safeGatherv(redist.roots[target].data(), local_count_64, MPI_UINT32_T,
+                rank == target ? g_roots.data() : nullptr,
+                recv_counts, displs, target, rank, nprocs, MPI_COMM_WORLD);
+    safeGatherv(redist.pids[target].data(), local_count_64, MPI_UINT32_T,
+                rank == target ? g_pids.data() : nullptr,
+                recv_counts, displs, target, rank, nprocs, MPI_COMM_WORLD);
+    safeGatherv(redist.bytes_sent[target].data(), local_count_64, MPI_UINT64_T,
                 rank == target ? g_bytes_sent.data() : nullptr,
-                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
-                MPI_COMM_WORLD);
-    MPI_Gatherv(redist.bytes_received[target].data(), local_count, MPI_UINT64_T,
+                recv_counts, displs, target, rank, nprocs, MPI_COMM_WORLD);
+    safeGatherv(redist.bytes_received[target].data(), local_count_64, MPI_UINT64_T,
                 rank == target ? g_bytes_received.data() : nullptr,
-                recv_counts.data(), displs.data(), MPI_UINT64_T, target,
-                MPI_COMM_WORLD);
+                recv_counts, displs, target, rank, nprocs, MPI_COMM_WORLD);
 
-    // Gatherv variable-length comm_sets
-    int local_cs_len = (int)redist.flat_comm_sets[target].size();
-    std::vector<int> cs_lens(nprocs), cs_displs(nprocs);
-    MPI_Gather(&local_cs_len, 1, MPI_INT, cs_lens.data(), 1, MPI_INT, target,
-               MPI_COMM_WORLD);
+    // Gatherv variable-length comm_sets (most likely to overflow)
+    int64_t local_cs_len = (int64_t)redist.flat_comm_sets[target].size();
+    std::vector<int64_t> cs_lens(nprocs), cs_displs(nprocs);
+    MPI_Gather(&local_cs_len, 1, MPI_INT64_T, cs_lens.data(), 1, MPI_INT64_T,
+               target, MPI_COMM_WORLD);
 
-    int total_cs = 0;
+    int64_t total_cs = 0;
     if (rank == target) {
       for (int i = 0; i < nprocs; i++) {
         cs_displs[i] = total_cs;
@@ -603,10 +687,9 @@ static void redistributeCollectives(Pass2DataCallback &cb,
     if (rank == target)
       g_flat_cs.resize(total_cs);
 
-    MPI_Gatherv(redist.flat_comm_sets[target].data(), local_cs_len,
+    safeGatherv(redist.flat_comm_sets[target].data(), local_cs_len,
                 MPI_UINT64_T, rank == target ? g_flat_cs.data() : nullptr,
-                cs_lens.data(), cs_displs.data(), MPI_UINT64_T, target,
-                MPI_COMM_WORLD);
+                cs_lens, cs_displs, target, rank, nprocs, MPI_COMM_WORLD);
 
     // On target rank: reconstruct and append
     if (rank == target && total > 0) {
@@ -885,6 +968,13 @@ void readerFillSoA(void *handle, TraceDataSoA &data) {
   auto *cb = static_cast<Pass2DataCallback *>(handle);
   cb->fillSoAInto(data);
 }
+
+#ifdef USE_SCALASCA_TIMESTAMPS
+std::vector<timestamp_t> readerGetLeaveRecvTs(void *handle) {
+  auto *cb = static_cast<Pass2DataCallback *>(handle);
+  return std::move(cb->getLeaveRecvTs());
+}
+#endif
 
 void readerRelease(void *handle) {
   auto *cb = static_cast<Pass2DataCallback *>(handle);
