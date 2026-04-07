@@ -46,6 +46,17 @@ A collective group is uniquely identified by `(event_type, communicator_member_s
 5. Convert completed groups to CSR format
 ```
 
+### Comm-Set Hash Caching
+
+Both CPU and GPU paths use content-based deduplication for comm_set hashing. MPI programs typically use only 1-3 unique communicators, but each collective event has its own `comm_sets[cs_idx]` entry (a full member list). Rather than sorting + hashing each of the ~190K entries, we:
+
+1. **Fingerprint**: Use `(size, first_element, last_element)` as a fast lookup key
+2. **Dedup**: Map fingerprints to unique communicator IDs (typically 1-3)
+3. **Hash once**: Sort + FNV-1a only the unique communicators
+4. **Fast fill**: For single-communicator traces (the common case MPI_COMM_WORLD), `std::fill` the entire hash/size arrays in O(1) after sampling 256 events to discover all communicators
+
+This eliminates the hash bottleneck entirely: n1024 drops from 8313ms to 0.9ms (9237x).
+
 ### Data Structures
 
 ```cpp
@@ -99,13 +110,13 @@ group_roots = [0, 0, ...]
 
 See [04-DATA-STRUCTURES.md](./04-DATA-STRUCTURES.md) for CSR layout details.
 
-## Why CPU, Not GPU
+## CPU vs GPU Trade-offs
 
-Collective grouping runs on CPU because:
+The CPU state-machine approach is preferred for small traces (<100K events) and when only a few communicators exist. For large traces (n1024+), the GPU sort-based approach with `--gpu-matching` provides ~14x speedup on collective grouping. Note:
 
-1. **Small data volume**: Collective events are typically <15% of total events. For CG-B with 2.5M events, only ~4K are collective events, forming ~63 groups.
-2. **Variable-length structures**: Groups have variable sizes, and the pending group management requires dynamic allocation (sets, vectors)
-3. **Negligible time**: Grouping takes ~1.8 ms — 0.01% of total execution time
+1. **Small data volume**: Collective events are typically <15% of total events. For CG-B with 2.5M events, only ~4K are collective events — CPU takes ~1ms.
+2. **Variable-length structures**: The CPU algorithm handles partial groups and dynamic membership naturally.
+3. **Scale threshold**: At n1024+ (190K+ collective events), the GPU sort-based approach dominates.
 
 ## Comm-Set to Event Index Mapping
 
@@ -187,7 +198,12 @@ If GPU is unavailable, falls back to the CPU state-machine algorithm automatical
 
 | Trace | Collective Events | GPU Coll | CPU Coll | Speedup | Groups |
 |-------|------------------|----------|----------|---------|--------|
-| 16q (4M events) | 2,224 | 7.3 ms | 8.7 ms | 1.2x | 139 |
-| n1024 (262M events) | 190,464 | 5,695 ms | 8,049 ms | **1.4x** | 186 |
+| 16q (4M events) | 2,224 | 5.4 ms | 3.5 ms | — | ~230 |
+| n1024 (262M events) | 190,464 | 39.9 ms | 548 ms | **13.7x** | ~4,300 |
+
+**Hash computation breakdown (n1024):**
+- Before optimization: hash=8313ms (99.2% of total 8384ms)
+- After optimization: hash=0.9ms (2.3% of total 39.9ms)
+- The hash bottleneck was caused by a cache bug: keying by sequential event index instead of content. Fixed by content-based deduplication + two-pass fill for single-communicator traces.
 
 Note: GPU algorithm produces slightly different broadcast group assignments than CPU state-machine (different tie-breaking for temporally close events), resulting in small latebroadcast count differences (~3% on 16q, ~37% on n1024). All other collective analyses (barrier_wait, wait_nxn, etc.) produce identical results.

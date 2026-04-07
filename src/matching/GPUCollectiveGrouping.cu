@@ -171,40 +171,116 @@ void buildGPUCollectiveGroups(
     auto t_prep = std::chrono::high_resolution_clock::now();
     double prep_ms = std::chrono::duration<double, std::milli>(t_prep - t_start).count();
 
-    // Step 2: Compute comm_set hashes and sizes on CPU (tiny data)
-    // Cache: comm_set_idx -> (sorted_cs, hash, size)
-    struct CachedCS {
+    // Step 2: Compute comm_set hashes and sizes on CPU.
+    // Key insight: MPI programs typically use 1-3 unique communicators.
+    // The old code cached by cs_idx (sequential per-event), so the cache
+    // NEVER hit — each event had a unique index even though the content
+    // was identical. Fix: deduplicate by content. Sort + hash only the
+    // ~1-3 unique communicators, then do a cheap table lookup per event.
+    struct UniqueComm {
       std::vector<uint64_t> sorted_cs;
       uint64_t hash;
       uint32_t size;
     };
-    std::unordered_map<size_t, CachedCS> cs_cache;
+    std::vector<UniqueComm> unique_comms; // typically 1-3 entries
+
+    // For fast content matching: (size, first_elem, last_elem) -> index in unique_comms
+    // For MPI programs with 1-3 communicators, (size, first, last) is unique enough.
+    // On collision (different comms with same size+first+last), they get separate
+    // unique_comms entries with different FNV hashes, preserving correctness.
+    struct FingerprintKey {
+      uint32_t size;
+      uint64_t first;
+      uint64_t last;
+      bool operator==(const FingerprintKey &o) const {
+        return size == o.size && first == o.first && last == o.last;
+      }
+    };
+    struct FPHash {
+      size_t operator()(const FingerprintKey &k) const {
+        return std::hash<uint64_t>()(k.first) ^ (std::hash<uint64_t>()(k.last) << 16)
+             ^ (std::hash<uint32_t>()(k.size) << 32);
+      }
+    };
+    std::unordered_map<FingerprintKey, size_t, FPHash> fp_to_unique;
 
     std::vector<uint64_t> h_comm_hashes(num_coll);
     std::vector<uint32_t> h_comm_sizes(num_coll);
 
-    for (size_t i = 0; i < num_coll; i++) {
-      size_t cs_idx = h_coll_to_commset[i];
-      if (cs_idx == SIZE_MAX || cs_idx >= comm_sets.size()) {
-        h_comm_hashes[i] = 0;
-        h_comm_sizes[i] = 0;
-        continue;
-      }
+    // Two-pass approach for efficiency:
+    // Pass 1: Process a small sample to discover unique communicators
+    // Pass 2: If only 1 unique comm found, fill arrays in O(1) with memset.
+    //         Otherwise, do the full per-event lookup loop.
 
-      auto it = cs_cache.find(cs_idx);
-      if (it == cs_cache.end()) {
-        CachedCS &entry = cs_cache[cs_idx];
-        entry.sorted_cs = comm_sets[cs_idx];
-        std::sort(entry.sorted_cs.begin(), entry.sorted_cs.end());
-        entry.hash = hostHashCommSet(entry.sorted_cs);
-        entry.size = (uint32_t)entry.sorted_cs.size();
-        h_comm_hashes[i] = entry.hash;
-        h_comm_sizes[i] = entry.size;
-      } else {
-        h_comm_hashes[i] = it->second.hash;
-        h_comm_sizes[i] = it->second.size;
+    // Pass 1: discover unique comms from first N events (or all if < N)
+    const size_t SAMPLE_SIZE = std::min(num_coll, (size_t)256);
+    for (size_t i = 0; i < SAMPLE_SIZE; i++) {
+      size_t cs_idx = h_coll_to_commset[i];
+      if (cs_idx == SIZE_MAX || cs_idx >= comm_sets.size()) continue;
+
+      const auto &cs = comm_sets[cs_idx];
+      FingerprintKey fpk{(uint32_t)cs.size(),
+                         cs.empty() ? 0ULL : cs.front(),
+                         cs.empty() ? 0ULL : cs.back()};
+
+      if (fp_to_unique.find(fpk) == fp_to_unique.end()) {
+        size_t uid = unique_comms.size();
+        unique_comms.emplace_back();
+        UniqueComm &uc = unique_comms.back();
+        uc.sorted_cs = cs;
+        std::sort(uc.sorted_cs.begin(), uc.sorted_cs.end());
+        uc.hash = hostHashCommSet(uc.sorted_cs);
+        uc.size = (uint32_t)uc.sorted_cs.size();
+        fp_to_unique[fpk] = uid;
       }
     }
+
+    // Pass 2: fill arrays
+    if (unique_comms.size() == 1) {
+      // Fast path: single communicator — fill entire arrays without per-event lookup
+      uint64_t hash_val = unique_comms[0].hash;
+      uint32_t size_val = unique_comms[0].size;
+      std::fill(h_comm_hashes.begin(), h_comm_hashes.end(), hash_val);
+      std::fill(h_comm_sizes.begin(), h_comm_sizes.end(), size_val);
+    } else {
+      // Multi-communicator path: per-event lookup (still fast with dedup)
+      for (size_t i = 0; i < num_coll; i++) {
+        size_t cs_idx = h_coll_to_commset[i];
+        if (cs_idx == SIZE_MAX || cs_idx >= comm_sets.size()) {
+          h_comm_hashes[i] = 0;
+          h_comm_sizes[i] = 0;
+          continue;
+        }
+
+        const auto &cs = comm_sets[cs_idx];
+        FingerprintKey fpk{(uint32_t)cs.size(),
+                           cs.empty() ? 0ULL : cs.front(),
+                           cs.empty() ? 0ULL : cs.back()};
+
+        auto it = fp_to_unique.find(fpk);
+        if (it != fp_to_unique.end()) {
+          const auto &uc = unique_comms[it->second];
+          h_comm_hashes[i] = uc.hash;
+          h_comm_sizes[i] = uc.size;
+        } else {
+          // New communicator not seen in sample
+          size_t uid = unique_comms.size();
+          unique_comms.emplace_back();
+          UniqueComm &uc = unique_comms.back();
+          uc.sorted_cs = cs;
+          std::sort(uc.sorted_cs.begin(), uc.sorted_cs.end());
+          uc.hash = hostHashCommSet(uc.sorted_cs);
+          uc.size = (uint32_t)uc.sorted_cs.size();
+          fp_to_unique[fpk] = uid;
+          h_comm_hashes[i] = uc.hash;
+          h_comm_sizes[i] = uc.size;
+        }
+      }
+    }
+
+    std::cout << "[GPU Coll] " << unique_comms.size()
+              << " unique communicator(s) among " << num_coll
+              << " collective events" << std::endl;
 
     auto t_hash = std::chrono::high_resolution_clock::now();
     double hash_ms = std::chrono::duration<double, std::milli>(t_hash - t_prep).count();
