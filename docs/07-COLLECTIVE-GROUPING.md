@@ -152,3 +152,42 @@ The module prints group counts per collective type:
 [CollectiveGrouping] Built 63 groups with 4032 total members
   MPI_Bcast: 63 groups
 ```
+
+---
+
+## GPU Segment-Scan Grouping (Phase 3)
+
+**Source**: `src/matching/GPUCollectiveGrouping.cu`
+**Header**: `include/matching/GPUCollectiveGrouping.h`
+**Enabled by**: `--gpu-matching` command-line flag
+
+### Algorithm: Sort + Segment Scan
+
+The GPU grouping exploits the fact that for a fixed `(event_type, communicator)` pair, all collective instances have the same group size P (the communicator size). This allows reformulating the sequential state machine as a parallel sort:
+
+1. **Filter**: Extract collective event indices and build comm_set hash/size tables (CPU, since this is O(C) where C ≪ N)
+2. **Sort on GPU**: Build sort keys `(event_type << 32 | comm_set_hash_low32, timestamp)`, then two-level stable sort groups events by `(type, communicator, time)`
+3. **Segment scan**: `thrust::exclusive_scan_by_key` computes position within each `(type, communicator)` segment
+4. **Assign group IDs**: `group_id = position_within_segment / communicator_size`
+5. **Build CSR on CPU**: Download sorted results (~190K events for n1024, tiny), build CSR arrays on host
+
+### Key Insight
+
+For typical MPI programs, all instances of the same collective operation on the same communicator have exactly the same group size. Given K events on communicator C (size P), sorted by timestamp, the first P events form group 0, the next P form group 1, etc.
+
+### Memory Requirements
+
+~44 bytes per collective event for GPU scratch. For n1024 (190K collective events): ~8.4 MB — negligible.
+
+### Fallback
+
+If GPU is unavailable, falls back to the CPU state-machine algorithm automatically.
+
+### Performance
+
+| Trace | Collective Events | GPU Coll | CPU Coll | Speedup | Groups |
+|-------|------------------|----------|----------|---------|--------|
+| 16q (4M events) | 2,224 | 7.3 ms | 8.7 ms | 1.2x | 139 |
+| n1024 (262M events) | 190,464 | 5,695 ms | 8,049 ms | **1.4x** | 186 |
+
+Note: GPU algorithm produces slightly different broadcast group assignments than CPU state-machine (different tie-breaking for temporally close events), resulting in small latebroadcast count differences (~3% on 16q, ~37% on n1024). All other collective analyses (barrier_wait, wait_nxn, etc.) produce identical results.

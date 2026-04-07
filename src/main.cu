@@ -4,6 +4,8 @@
 #include "common/cuda_check.h"
 #include "data/AnalysisResults.h"
 #include "matching/CollectiveGrouping.h"
+#include "matching/GPUCollectiveGrouping.h"
+#include "matching/GPUP2PMatching.h"
 #include "matching/P2PMatching.h"
 #include "reader/OTF2SoAReader.h"
 
@@ -20,6 +22,9 @@
 #include <cuda_runtime.h>
 #include <mpi.h>
 #include <sys/mman.h>
+
+// Global flag: use GPU-based P2P matching and collective grouping
+static bool g_gpu_matching = false;
 
 static void printGpuInfo() {
   int device;
@@ -1138,15 +1143,22 @@ colmajorDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
 
   // --- P2P Matching ---
   tp0 = std::chrono::high_resolution_clock::now();
-  runP2PMatching(local_data);
+  if (g_gpu_matching && rank == 0)
+    runGPUP2PMatching(local_data);
+  else
+    runP2PMatching(local_data);
   tp1 = std::chrono::high_resolution_clock::now();
   t_p2p = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
   // --- Collective Grouping ---
   tp0 = std::chrono::high_resolution_clock::now();
   CollectiveGroupCSR local_csr;
-  buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent,
-                        phase1.coll_bytes_received, local_csr);
+  if (g_gpu_matching && rank == 0)
+    buildGPUCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent,
+                             phase1.coll_bytes_received, local_csr);
+  else
+    buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent,
+                          phase1.coll_bytes_received, local_csr);
   tp1 = std::chrono::high_resolution_clock::now();
   t_coll = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
@@ -1444,9 +1456,15 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
     readerFillSoA(phase1.handle, local_data);
     readerRelease(phase1.handle);
     phase1.handle = nullptr;
-    runP2PMatching(local_data);
+    if (g_gpu_matching && rank == 0)
+      runGPUP2PMatching(local_data);
+    else
+      runP2PMatching(local_data);
     CollectiveGroupCSR local_csr;
-    buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
+    if (g_gpu_matching && rank == 0)
+      buildGPUCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
+    else
+      buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
 #ifdef USE_SCALASCA_TIMESTAMPS
     if (time_correct)
       applyTimestampCorrection(local_data);
@@ -1583,14 +1601,20 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
 
   // --- P2P Matching (local, on shared window) ---
   tp0 = std::chrono::high_resolution_clock::now();
-  runP2PMatching(local_data);
+  if (g_gpu_matching && rank == 0)
+    runGPUP2PMatching(local_data);
+  else
+    runP2PMatching(local_data);
   tp1 = std::chrono::high_resolution_clock::now();
   t_p2p_match = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
   // --- Collective Grouping (local, on shared window) ---
   tp0 = std::chrono::high_resolution_clock::now();
   CollectiveGroupCSR local_csr;
-  buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
+  if (g_gpu_matching && rank == 0)
+    buildGPUCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
+  else
+    buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
   tp1 = std::chrono::high_resolution_clock::now();
   t_coll_group = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
@@ -1704,7 +1728,7 @@ int main(int argc, char **argv) {
   if (argc < 2) {
     if (mpi_rank == 0)
       std::cerr << "Usage: " << argv[0]
-                << " <path/to/traces.otf2> [--time-correct]" << std::endl;
+                << " <path/to/traces.otf2> [--time-correct] [--gpu-matching]" << std::endl;
     MPI_Finalize();
     return 1;
   }
@@ -1714,6 +1738,8 @@ int main(int argc, char **argv) {
   for (int i = 2; i < argc; i++) {
     if (std::string(argv[i]) == "--time-correct") {
       time_correct = true;
+    } else if (std::string(argv[i]) == "--gpu-matching") {
+      g_gpu_matching = true;
     }
   }
 
@@ -1733,6 +1759,8 @@ int main(int argc, char **argv) {
               << std::endl;
     if (time_correct)
       std::cout << "Timestamp correction: ENABLED (--time-correct)" << std::endl;
+    if (g_gpu_matching)
+      std::cout << "GPU matching: ENABLED (--gpu-matching)" << std::endl;
     std::cout << std::endl;
   }
 
@@ -1776,9 +1804,15 @@ int main(int argc, char **argv) {
     readerRelease(phase1.handle);
     phase1.handle = nullptr;
 
-    runP2PMatching(local_data);
+    if (g_gpu_matching)
+      runGPUP2PMatching(local_data);
+    else
+      runP2PMatching(local_data);
     CollectiveGroupCSR csr;
-    buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, csr);
+    if (g_gpu_matching)
+      buildGPUCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, csr);
+    else
+      buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, csr);
 #ifdef USE_SCALASCA_TIMESTAMPS
     if (time_correct)
       applyTimestampCorrection(local_data);

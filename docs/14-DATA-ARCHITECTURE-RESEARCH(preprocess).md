@@ -443,22 +443,26 @@ No file format change is needed: the same column-major cache file works for both
 
 ### Phase 2: GPU P2P Matching
 
-**Prerequisite**: Phase 1 (or independent, since matching is CPU-side independent of I/O)
+**Status**: Implemented and validated (`src/matching/GPUP2PMatching.cu`, enabled by `--gpu-matching`)
 
 GPU sort-based P2P matching (section 2):
-- Remove `src/matching/P2PMatching.cpp` dependency on CPU `std::sort` and hash maps
-- Implement `gpuP2PMatchSort()` in CUDA using CUB/thrust
-- Keep CPU version as fallback (controlled by a compile flag)
-- Expected improvement: matching from 617 ms → ~15-50 ms (for n1024, 65M send+recv pairs)
+- Implemented `runGPUP2PMatching()` using thrust sort + exclusive_scan_by_key
+- CPU version kept as fallback (selected at runtime by absence of `--gpu-matching`)
+- Algorithm: classify → compact → sort by (key, timestamp) → assign ordinals → binary-search match
+- **Measured results**: 16q: 172 ms (CPU: 3439 ms, **20x speedup**). n1024: 2591 ms (CPU: 5677 ms, **2.2x speedup**).
+- **Correctness**: Exact match with CPU P2P matching (all 8 analyses identical for both traces)
+- Note: thrust::reduce unreliable in multi-TU separable compilation builds; uses CPU-side counting via cudaMemcpy as workaround
 
 ### Phase 3: GPU Collective Grouping
 
-**Prerequisite**: Phase 1 (or independent)
+**Status**: Implemented (`src/matching/GPUCollectiveGrouping.cu`, enabled by `--gpu-matching`)
 
 GPU segment-scan collective grouping (section 3):
-- Remove `src/matching/CollectiveGrouping.cpp` CPU set/map implementation
-- Implement `gpuCollGroupSort()` in CUDA
-- Expected improvement: 2,875 ms → ~5-20 ms (190K collective events for n1024)
+- Implemented `buildGPUCollectiveGroups()` using thrust sort + segment scan
+- CPU version kept as fallback
+- Algorithm: filter → hash comm_sets → sort by (type|hash, timestamp) → segment scan → group_id = pos/comm_size → CSR on CPU
+- **Measured results**: 16q: 7.3 ms (CPU: 8.7 ms, **1.2x**). n1024: 5695 ms (CPU: 8049 ms, **1.4x**). Hash computation dominates on n1024 (5508 ms).
+- **Correctness**: Small differences vs CPU state-machine algorithm for broadcast groups (different tie-breaking for temporally close events). P2P-dependent analyses (late_sender, late_receiver) and most collective analyses (barrier_wait, wait_nxn) are unaffected.
 
 ### Phase 4: mmap-Based Reader (No cuFile)
 
