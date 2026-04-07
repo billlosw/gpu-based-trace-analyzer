@@ -3,7 +3,6 @@
 
 #include "common/types.h"
 #include "data/TraceDataSoA.h"
-#include "reader/ColumnMajorCache.h"
 #include <string>
 #include <vector>
 
@@ -30,11 +29,6 @@ struct ReaderPhase1Output {
   std::vector<uint64_t> coll_bytes_sent;
   std::vector<uint64_t> coll_bytes_received;
   void *handle; // opaque; must pass to readerFillSoA then readerRelease
-
-  // Column-major mmap handle (non-null on colmajor cache hit).
-  // When set, sharedMemoryDirectAnalysis uses mmap'd data directly
-  // instead of allocating a SHM window.
-  ColumnMajorMmap *colmajor_mmap = nullptr;
 };
 
 // Phase 1: pass1 + pass2 + redistribution. Returns event count, comm_sets,

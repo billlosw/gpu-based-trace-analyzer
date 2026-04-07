@@ -1,6 +1,5 @@
 #include "reader/OTF2SoAReader.h"
 #include "reader/SoACache.h"
-#include "reader/ColumnMajorCache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +18,7 @@
 // ============================================================
 // Handle tag: distinguishes OTF2 callback vs cached data handles
 // ============================================================
-enum HandleType : uint32_t { HANDLE_OTF2_CALLBACK = 0, HANDLE_CACHE = 1, HANDLE_COLMAJOR = 2 };
+enum HandleType : uint32_t { HANDLE_OTF2_CALLBACK = 0, HANDLE_CACHE = 1 };
 
 // Opaque handle wrapper: holds a tag + pointer to actual data
 struct ReaderHandle {
@@ -919,56 +918,6 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
   }
   MPI_Bcast(fingerprint, 32, MPI_BYTE, 0, MPI_COMM_WORLD);
 
-  // ======== TRY COLUMN-MAJOR CACHE FIRST ========
-  std::string colmajor_path = getColumnMajorCachePath(trace_path, comm_sz);
-  bool colmajor_hit = false;
-  {
-    int local_ok = isColumnMajorCacheValid(colmajor_path, fingerprint, comm_sz) ? 1 : 0;
-    // Only rank 0 needs to validate (single file), broadcast result
-    int global_ok = 0;
-    if (rank == 0) global_ok = local_ok;
-    MPI_Bcast(&global_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    colmajor_hit = (global_ok == 1);
-  }
-
-  if (colmajor_hit) {
-    auto *cmmap = new ColumnMajorMmap();
-    bool open_ok = openColumnMajorCache(colmajor_path, fingerprint, comm_sz, *cmmap);
-
-    int local_ok = open_ok ? 1 : 0;
-    int global_ok = 0;
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-
-    if (global_ok == 1) {
-      auto t_cache = std::chrono::high_resolution_clock::now();
-      double cache_ms =
-          std::chrono::duration<double, std::milli>(t_cache - t_start).count();
-
-      uint64_t my_count = cmmap->rankEventCount(rank);
-
-      if (rank == 0) {
-        std::cout << "[Reader] Column-major cache HIT (" << cmmap->total_events
-                  << " total events, " << my_count << " on rank 0), mmap'd in "
-                  << cache_ms << " ms" << std::endl;
-      }
-
-      result.event_count = my_count;
-      // Copy this rank's metadata from mmap
-      result.comm_sets = cmmap->rank_meta[rank].comm_sets;
-      result.coll_bytes_sent = cmmap->rank_meta[rank].coll_bytes_sent;
-      result.coll_bytes_received = cmmap->rank_meta[rank].coll_bytes_received;
-      result.colmajor_mmap = cmmap;
-      // handle is not needed for colmajor path, but set to non-null sentinel
-      result.handle = static_cast<void *>(
-          new ReaderHandle(HANDLE_COLMAJOR, nullptr));
-      return result;
-    } else {
-      delete cmmap;
-      if (rank == 0)
-        std::cout << "[Reader] Column-major cache file found but mmap failed, trying per-rank cache..." << std::endl;
-    }
-  }
-
   // ======== TRY PER-RANK CACHE ========
   std::string cache_path = getCachePath(trace_path, rank, comm_sz);
   SoACacheData cached;
@@ -1135,22 +1084,6 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
     }
   }
 
-  // ======== WRITE COLUMN-MAJOR CACHE ========
-  {
-    auto t_cm0 = std::chrono::high_resolution_clock::now();
-    bool cm_ok = writeColumnMajorCache(colmajor_path, fingerprint, comm_sz, cd, rank);
-    auto t_cm1 = std::chrono::high_resolution_clock::now();
-    double cm_write_ms =
-        std::chrono::duration<double, std::milli>(t_cm1 - t_cm0).count();
-    if (rank == 0) {
-      if (cm_ok)
-        std::cout << "[Reader] Column-major cache written to " << colmajor_path
-                  << " in " << cm_write_ms << " ms" << std::endl;
-      else
-        std::cout << "[Reader] Column-major cache write FAILED" << std::endl;
-    }
-  }
-
   result.event_count = data_cb->getEventCount();
   result.comm_sets = std::move(data_cb->getCommSets());
   result.coll_bytes_sent = std::move(data_cb->getCollBytesSent());
@@ -1162,12 +1095,6 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
 
 void readerFillSoA(void *handle, TraceDataSoA &data) {
   auto *rh = static_cast<ReaderHandle *>(handle);
-  if (rh->tag == HANDLE_COLMAJOR) {
-    // Column-major mmap path: no-op here. Data is filled directly from mmap
-    // in sharedMemoryDirectAnalysis via colmajorFillSoA or pointer setup.
-    // If called for single-rank fallback, we shouldn't reach here.
-    return;
-  }
   if (rh->tag == HANDLE_CACHE) {
     auto *holder = static_cast<SoACacheDataHolder *>(rh->ptr);
     size_t n = holder->data.events.size();
@@ -1199,11 +1126,6 @@ void readerFillSoA(void *handle, TraceDataSoA &data) {
 #ifdef USE_SCALASCA_TIMESTAMPS
 std::vector<timestamp_t> readerGetLeaveRecvTs(void *handle) {
   auto *rh = static_cast<ReaderHandle *>(handle);
-  if (rh->tag == HANDLE_COLMAJOR) {
-    // Leave_recv_ts is in the mmap — return empty vector.
-    // The caller should use colmajor_mmap directly.
-    return {};
-  }
   if (rh->tag == HANDLE_CACHE) {
     auto *holder = static_cast<SoACacheDataHolder *>(rh->ptr);
     return std::move(holder->data.leave_recv_ts);
@@ -1215,9 +1137,7 @@ std::vector<timestamp_t> readerGetLeaveRecvTs(void *handle) {
 
 void readerRelease(void *handle) {
   auto *rh = static_cast<ReaderHandle *>(handle);
-  if (rh->tag == HANDLE_COLMAJOR) {
-    // Column-major mmap is owned by ReaderPhase1Output::colmajor_mmap, not here
-  } else if (rh->tag == HANDLE_CACHE) {
+  if (rh->tag == HANDLE_CACHE) {
     delete static_cast<SoACacheDataHolder *>(rh->ptr);
   } else {
     delete static_cast<Pass2DataCallback *>(rh->ptr);
