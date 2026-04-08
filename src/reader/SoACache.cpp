@@ -201,3 +201,59 @@ bool readSoACache(const std::string &cache_path,
 
   return true;
 }
+
+bool readCacheCommSets(const std::string &cache_path,
+                       const uint8_t fingerprint[32], int rank, int nprocs,
+                       std::vector<std::vector<uint64_t>> &comm_sets,
+                       std::vector<uint64_t> &coll_bytes_sent,
+                       std::vector<uint64_t> &coll_bytes_received) {
+  SoACacheHeader hdr;
+  if (!isCacheValid(cache_path, fingerprint, rank, nprocs, hdr))
+    return false;
+
+  std::ifstream f(cache_path, std::ios::binary);
+  if (!f.is_open())
+    return false;
+
+  // Skip header + all SoA arrays to reach comm_sets
+  size_t n = hdr.event_count;
+  size_t soa_bytes = 0;
+  if (n > 0) {
+    // events(int32) + types(int32) + timestamps(u64) + end_timestamps(u64)
+    // + pids(u32) + srcs(u32) + dsts(u32) + tags(u32) + roots(u32)
+    soa_bytes = n * (sizeof(int32_t) * 2 + sizeof(uint64_t) * 2 + sizeof(uint32_t) * 5);
+    if (hdr.flags & SOA_CACHE_FLAG_HAS_LEAVE_RECV_TS)
+      soa_bytes += n * sizeof(uint64_t);
+  }
+  f.seekg(sizeof(SoACacheHeader) + soa_bytes);
+
+  // Read comm_sets
+  size_t ncs = hdr.num_comm_sets;
+  comm_sets.resize(ncs);
+  for (size_t i = 0; i < ncs; i++) {
+    uint64_t sz;
+    f.read(reinterpret_cast<char *>(&sz), sizeof(sz));
+    comm_sets[i].resize(sz);
+    if (sz > 0)
+      f.read(reinterpret_cast<char *>(comm_sets[i].data()),
+             sz * sizeof(uint64_t));
+  }
+
+  // Read collective bytes
+  if (ncs > 0) {
+    coll_bytes_sent.resize(ncs);
+    coll_bytes_received.resize(ncs);
+    f.read(reinterpret_cast<char *>(coll_bytes_sent.data()),
+           ncs * sizeof(uint64_t));
+    f.read(reinterpret_cast<char *>(coll_bytes_received.data()),
+           ncs * sizeof(uint64_t));
+  }
+
+  if (!f.good() && !f.eof()) {
+    std::cerr << "[SoACache] Warning: read error (comm_sets) in " << cache_path
+              << std::endl;
+    return false;
+  }
+
+  return true;
+}

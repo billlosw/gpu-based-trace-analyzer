@@ -84,4 +84,12 @@ bool writeSoACache(const std::string &cache_path, const uint8_t fingerprint[32],
 bool readSoACache(const std::string &cache_path, const uint8_t fingerprint[32],
                   int rank, int nprocs, SoACacheData &data);
 
+// Read ONLY the comm_sets and collective bytes from a cache file (skips SoA arrays).
+// Used to re-load comm_sets after they were freed to reduce peak memory.
+bool readCacheCommSets(const std::string &cache_path,
+                       const uint8_t fingerprint[32], int rank, int nprocs,
+                       std::vector<std::vector<uint64_t>> &comm_sets,
+                       std::vector<uint64_t> &coll_bytes_sent,
+                       std::vector<uint64_t> &coll_bytes_received);
+
 #endif // GPU_ANALYZER_SOA_CACHE_H

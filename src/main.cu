@@ -8,6 +8,7 @@
 #include "matching/GPUP2PMatching.h"
 #include "matching/P2PMatching.h"
 #include "reader/OTF2SoAReader.h"
+#include "reader/SoACache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -947,7 +948,8 @@ shmRunBatchedGPU(char *base, const ShmSoALayout &layout,
 // ============================================================
 static ShmAnalysisResult
 sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
-                           bool time_correct) {
+                           bool time_correct,
+                           const std::string &trace_path) {
   ShmAnalysisResult result;
   auto tp0 = std::chrono::high_resolution_clock::now();
   auto tp1 = tp0;
@@ -1025,6 +1027,14 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   }
 
   // --- Compute layout & allocate shared window ---
+  // Free comm_sets before SHM allocation to reduce peak memory.
+  // For n4096, rank 0's comm_sets hold ~24 GB (761K events × 4096 members × 8B).
+  // They will be re-read from cache before collective grouping.
+  bool had_comm_sets = !phase1.comm_sets.empty();
+  { std::vector<std::vector<uint64_t>>().swap(phase1.comm_sets); }
+  { std::vector<uint64_t>().swap(phase1.coll_bytes_sent); }
+  { std::vector<uint64_t>().swap(phase1.coll_bytes_received); }
+
   tp0 = std::chrono::high_resolution_clock::now();
   ShmSoALayout layout;
   layout.compute(total_events);
@@ -1131,6 +1141,24 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
   t_p2p_match = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
 
   // --- Collective Grouping (local, on shared window) ---
+  // Re-load comm_sets from cache if they were freed before SHM allocation.
+  // Only rank 0 needs them (coll grouping runs on rank 0 for GPU path,
+  // or operates on per-rank chunks for CPU path).
+  if (had_comm_sets && phase1.comm_sets.empty()) {
+    uint8_t fingerprint[32];
+    if (rank == 0) {
+      computeFileFingerprint(trace_path, fingerprint);
+      std::string cache_path = getCachePath(trace_path, rank, nprocs);
+      if (!readCacheCommSets(cache_path, fingerprint, rank, nprocs,
+                             phase1.comm_sets, phase1.coll_bytes_sent,
+                             phase1.coll_bytes_received)) {
+        std::cerr << "[Warning] Failed to re-load comm_sets from cache" << std::endl;
+      } else {
+        std::cout << "[Reader] Re-loaded " << phase1.comm_sets.size()
+                  << " comm_sets from cache for collective grouping" << std::endl;
+      }
+    }
+  }
   tp0 = std::chrono::high_resolution_clock::now();
   CollectiveGroupCSR local_csr;
   if (g_gpu_matching && rank == 0)
@@ -1139,6 +1167,12 @@ sharedMemoryDirectAnalysis(ReaderPhase1Output &phase1, int rank, int nprocs,
     buildCollectiveGroups(local_data, phase1.comm_sets, phase1.coll_bytes_sent, phase1.coll_bytes_received, local_csr);
   tp1 = std::chrono::high_resolution_clock::now();
   t_coll_group = std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+
+  // Free comm_sets after collective grouping to reduce memory pressure.
+  // For n4096, rank 0's comm_sets hold ~24 GB (761K events × 4096 members × 8B).
+  { std::vector<std::vector<uint64_t>>().swap(phase1.comm_sets); }
+  { std::vector<uint64_t>().swap(phase1.coll_bytes_sent); }
+  { std::vector<uint64_t>().swap(phase1.coll_bytes_received); }
 
   // --- Timestamp Correction (conditional) ---
 #ifdef USE_SCALASCA_TIMESTAMPS
@@ -1304,6 +1338,14 @@ int main(int argc, char **argv) {
     std::cout << std::endl;
   }
 
+  // Downsize reader handle: replace heavy OTF2 callback with lightweight
+  // cache-backed handle. Saves ~55 GB on n4096 (128 ranks × 9M events)
+  // by freeing the callback's over-capacity vectors and hash maps before
+  // the SHM window allocation.
+  if (mpi_size > 1) {
+    readerDownsizeHandle(phase1.handle, trace_path);
+  }
+
   // Steps 2-4: Shared memory direct analysis (single function for multi-rank)
   // or local analysis for single-rank. P2P matching, collective grouping,
   // and timestamp correction are done inside sharedMemoryDirectAnalysis
@@ -1347,7 +1389,7 @@ int main(int argc, char **argv) {
 #endif
   } else {
     // Multi-rank: SHM path
-    ShmAnalysisResult shm_result = sharedMemoryDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct);
+    ShmAnalysisResult shm_result = sharedMemoryDirectAnalysis(phase1, mpi_rank, mpi_size, time_correct, trace_path);
     raw = std::move(shm_result.raw);
     preprocess_ms = shm_result.preprocess_ms;
     gpu_analysis_ms = shm_result.gpu_analysis_ms;

@@ -329,6 +329,16 @@ struct ReaderHandle { HandleType tag; void *ptr; };
 
 The existing `readerFillSoA()`, `readerGetLeaveRecvTs()`, and `readerRelease()` functions dispatch based on the handle tag — the public API is unchanged.
 
+### Cache Writing: Streaming Approach
+
+Cache writing uses `writeDirectSoACache()` which streams directly from `Pass2DataCallback`'s internal vectors to disk via `std::ofstream`. This avoids materializing any intermediate `SoACacheData` or `TraceDataSoA` struct, eliminating ~1 GB/rank of peak memory overhead on large traces.
+
+Key design choices:
+- **Enum-to-int32 conversion** uses a chunked 1M-element temp buffer (4 MB) rather than allocating a full n-element array
+- **Timestamp and ID arrays** are written directly from callback vectors (same type in memory and cache format)
+- **Comm_sets and collective bytes** are referenced by ref from the callback (no copy)
+- **CollRedistBuffers freed before cache write** — swapped with empty object after redistribution completes
+
 ### Performance Impact
 
 | Trace | OTF2 Read (miss) | Cache Read (hit) | Speedup |
