@@ -20,6 +20,43 @@
 | NPB CG 1024 | NAS Parallel Benchmarks CG | 1024 | 262.4M | 9.9GB |
 | NPB CG 2048 | NAS Parallel Benchmarks CG | 2048 | 524.8M | 20GB |
 
+## Final RTX 5090 Collection (2026-05-13)
+
+Final paper logs were collected on fuse2 with one RTX 5090, 64 MPI reader ranks, and the final script in `scripts/final_res.sh`:
+
+```bash
+srun -N 1 -n 64 -w fuse2 -p Debug --mpi=pmix --gres=gpu:5090:1
+```
+
+Each trace was run in normal mode and with `--gpu-matching`. LAMMPS runs also used `--time-correct`. Logs are stored locally under `chat-history/logs/final-data/` with run stamp `260513-0934`.
+
+Cache note: normal runs were usually first and often paid OTF2 read/cache creation cost; paired `--gpu-matching` runs usually used a SoA cache hit. For mode comparisons, prefer `Preprocess`, `GPU Analysis`, `Analysis Total`, and `Statistics` over end-to-end `Total` when cache state differs.
+
+All times are milliseconds.
+
+| Trace | Mode | OTF2 Read | Preprocess | GPU Analysis | Analysis Total | Statistics | Total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| cgB | normal | 78553.01 | 1152.28 | 5162.16 | 6333.14 | 11.25 | 84974.49 |
+| cgB | gpu-matching | 9.95 | 190.83 | 15.42 | 223.04 | 11.47 | 244.68 |
+| cgC | normal | 177433.05 | 185.54 | 35.99 | 240.48 | 14.90 | 177698.38 |
+| cgC | gpu-matching | 10.87 | 190.53 | 14.06 | 221.28 | 16.33 | 248.70 |
+| cgD | normal | 1943062.55 | 220.58 | 41.08 | 286.29 | 22.23 | 1943380.89 |
+| cgD | gpu-matching | 11.50 | 215.12 | 18.29 | 256.53 | 26.92 | 295.55 |
+| lammps64 | normal | 40877.72 | 4426.85 | 98.36 | 4634.71 | 92.35 | 46283.77 |
+| lammps64 | gpu-matching | 27.61 | 532.96 | 78.57 | 732.02 | 95.77 | 855.63 |
+| lammps128 | normal | 76691.99 | 1048.30 | 186.35 | 1469.00 | 171.04 | 78880.43 |
+| lammps128 | gpu-matching | 58.83 | 949.08 | 235.24 | 1413.25 | 208.48 | 1680.79 |
+| lammps256 | normal | 29846.89 | 1915.62 | 454.56 | 2831.63 | 339.13 | 33017.90 |
+| lammps256 | gpu-matching | 184.23 | 1749.74 | 485.76 | 2719.08 | 343.80 | 3247.34 |
+| lammps512 | normal | 253423.34 | 3710.25 | 772.30 | 5549.15 | 670.12 | 262245.66 |
+| lammps512 | gpu-matching | 392.89 | 3558.59 | 631.66 | 5433.06 | 683.80 | 6509.99 |
+| lammps1024 | normal | 129402.42 | 7494.45 | 865.76 | 11862.76 | 1146.92 | 142412.42 |
+| lammps1024 | gpu-matching | 1769.97 | 6176.23 | 696.87 | 10042.59 | 1214.58 | 13027.38 |
+| lammps2048 | normal-rerun1 | 5730.67 | 11290.51 | 5066.93 | 21857.52 | 2161.65 | 29750.06 |
+| lammps2048 | gpu-matching-rerun1 | 6015.38 | 9027.57 | 4915.99 | 19509.73 | 2088.79 | 27614.13 |
+
+The original scripted `lammps2048` normal log stopped incomplete after Step 1 and is retained only for traceability; use the `normal-rerun1` log for final timing.
+
 ## Analysis Time Comparison (Excluding I/O)
 
 We compare **analysis time only**, excluding trace reading/I/O:
