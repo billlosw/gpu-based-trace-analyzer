@@ -7,9 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # sm_89 for RTX 4090 (Ada Lovelace). RTX 5090 uses PTX JIT from sm_89.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89)
-endif()
+set(CMAKE_CUDA_ARCHITECTURES 89)
 
 # Timestamp mode: SCALASCA (default) uses Enter-region timestamps for
 # Scalasca-compatible results. TILETRACE uses point-event timestamps
@@ -37,9 +35,13 @@ add_subdirectory(third_party/otf2xx)
 
 # Main library
 add_library(gpu_analyzer_lib STATIC
+    src/common/SHA256.cpp
     src/reader/OTF2SoAReader.cpp
+    src/reader/SoACache.cpp
     src/matching/P2PMatching.cpp
     src/matching/CollectiveGrouping.cpp
+    src/matching/GPUP2PMatching.cu
+    src/matching/GPUCollectiveGrouping.cu
     src/analysis/AnalysisKernels.cu
     src/analysis/Statistics.cpp
     src/analysis/TimestampCorrection.cpp

@@ -69,8 +69,8 @@ The key idea: replace TileTrace's multi-node CPU-based parallel analysis with a 
 |----------|--------|-----------|
 | Data layout | **SoA** (Structure of Arrays) | GPU coalesced memory access; warps read contiguous addresses |
 | Trace reading | **MPI-parallel two-pass**, split-phase API | Dominated by I/O; parallelizing across ranks gives near-linear speedup; split-phase enables direct-to-SHM writing |
-| P2P matching | **CPU** (pure `.cpp`), timestamp-sorted FIFO per rank | Requires temporal ordering; done locally on each rank in parallel; `.cu` caused 4.5x overhead from CUDA runtime init |
-| Collective grouping | **CPU**, comm_set-based CSR per rank | Variable-length groups; small fraction of total events; produces GPU-friendly CSR |
+| P2P matching | **CPU default**, optional GPU sort path via `--gpu-matching` | CPU path uses timestamp-sorted FIFO per rank; optional GPU path supports final performance comparison |
+| Collective grouping | **CPU default**, optional GPU segment-scan path via `--gpu-matching` | CPU path is comm_set-based CSR per rank; optional GPU path compares GPU preprocessing performance |
 | Data sharing | **MPI shared memory window** (same-node primary) | Zero-copy: all ranks write into shared buffer; eliminates 16+ GB MPI Send/Recv; 50% memory savings vs double-buffer |
 | GPU analysis | **Adaptive batch streaming on rank 0** | K ranks' data per GPU batch; K computed from VRAM; O(K*N/P) memory; GPUMemoryPool eliminates per-batch alloc |
 | Analysis kernels | **GPU CUDA kernels** | Massively parallel event processing; one thread/event for P2P, one block/group for collectives |
@@ -113,4 +113,5 @@ Validated on CG Class B and CG Class C traces (64 locations). See [09-TESTING.md
 | [11-ARCHITECTURE-RESEARCH.md](./11-ARCHITECTURE-RESEARCH.md) | Architecture exploration and research notes |
 | [12-PERFORMANCE-COMPARISON.md](./12-PERFORMANCE-COMPARISON.md) | Performance comparison: GPU Analyzer vs Scalasca |
 | [13-PERFORMANCE-ENHANCEMENT-PLAN.md](./13-PERFORMANCE-ENHANCEMENT-PLAN.md) | Prioritized performance optimization roadmap |
+| [14-DATA-ARCHITECTURE-RESEARCH.md](./14-DATA-ARCHITECTURE-RESEARCH.md) | GPU P2P/collective preprocessing, multi-GPU architecture, cuFile feasibility |
 | [PROBLEMS.md](./PROBLEMS.md) | Known issues, potential bugs, TODOs |

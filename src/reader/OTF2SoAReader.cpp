@@ -1,9 +1,11 @@
 #include "reader/OTF2SoAReader.h"
+#include "reader/SoACache.h"
 
 #include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <tuple>
@@ -13,6 +15,23 @@
 
 #include <mpi.h>
 #include <otf2xx/otf2.hpp>
+
+// ============================================================
+// Handle tag: distinguishes OTF2 callback vs cached data handles
+// ============================================================
+enum HandleType : uint32_t { HANDLE_OTF2_CALLBACK = 0, HANDLE_CACHE = 1 };
+
+// Opaque handle wrapper: holds a tag + pointer to actual data
+struct ReaderHandle {
+  HandleType tag;
+  void *ptr; // either Pass2DataCallback* or CacheHandle*
+
+  ReaderHandle(HandleType t, void *p) : tag(t), ptr(p) {}
+};
+
+struct SoACacheDataHolder {
+  SoACacheData data;
+};
 
 // ============================================================
 // Helper: contiguous block assignment (handles remainder)
@@ -439,6 +458,17 @@ public:
   std::vector<timestamp_t> &getLeaveRecvTs() { return m_v_leave_recv_ts; }
 #endif
 
+  // Direct const-ref getters for SoA vectors (avoids full TraceDataSoA copy)
+  const std::vector<event_t> &getEvents() const { return m_v_events; }
+  const std::vector<event_type_t> &getTypes() const { return m_v_types; }
+  const std::vector<timestamp_t> &getTimestamps() const { return m_v_timestamps; }
+  const std::vector<timestamp_t> &getEndTimestamps() const { return m_v_end_timestamps; }
+  const std::vector<id_t> &getPids() const { return m_v_pids; }
+  const std::vector<id_t> &getSrcs() const { return m_v_srcs; }
+  const std::vector<id_t> &getDsts() const { return m_v_dsts; }
+  const std::vector<id_t> &getTags() const { return m_v_tags; }
+  const std::vector<id_t> &getRoots() const { return m_v_roots; }
+
   // Append received collective events after redistribution
   void appendCollectiveEvents(const std::vector<int> &recv_op_types,
                               const std::vector<uint64_t> &recv_begin_ts,
@@ -836,8 +866,112 @@ ReaderOutput readOTF2Trace(const std::string &trace_path) {
 }
 
 // ============================================================
-// Split-phase reader API
+// Split-phase reader API (with binary SoA cache support)
 // ============================================================
+
+// Helper: write SoA cache directly from Pass2DataCallback vectors.
+// Avoids materializing an intermediate SoACacheData struct, saving ~50 bytes/event
+// of heap allocation. For n4096 (~9M events/rank), this saves ~450 MB per rank.
+static bool writeDirectSoACache(const std::string &cache_path,
+                                const uint8_t fingerprint[32],
+                                int rank, int nprocs,
+                                Pass2DataCallback &cb) {
+  size_t n = cb.getEventCount();
+
+  std::ofstream f(cache_path, std::ios::binary | std::ios::trunc);
+  if (!f.is_open()) {
+    std::cerr << "[SoACache] Warning: cannot write cache to " << cache_path
+              << std::endl;
+    return false;
+  }
+
+  // Build header
+  SoACacheHeader hdr;
+  memset(&hdr, 0, sizeof(hdr));
+  hdr.magic = SOA_CACHE_MAGIC;
+  hdr.version = SOA_CACHE_VERSION;
+  hdr.nprocs = nprocs;
+  hdr.rank = rank;
+  memcpy(hdr.fingerprint, fingerprint, 32);
+  hdr.event_count = n;
+  auto &comm_sets = cb.getCommSets();
+  hdr.num_comm_sets = comm_sets.size();
+  hdr.flags = 0;
+#ifdef USE_SCALASCA_TIMESTAMPS
+  if (!cb.getLeaveRecvTs().empty())
+    hdr.flags |= SOA_CACHE_FLAG_HAS_LEAVE_RECV_TS;
+#endif
+
+  f.write(reinterpret_cast<const char *>(&hdr), sizeof(hdr));
+
+  if (n > 0) {
+    // Write events and types with int32_t cast (event_t/event_type_t -> int32_t)
+    // These are small enums stored as int32_t in the cache format
+    const auto &events = cb.getEvents();
+    const auto &types = cb.getTypes();
+    // event_t and event_type_t may be enums backed by int, write via temp buffer
+    // Process in chunks to limit temp buffer size
+    const size_t CHUNK = 1024 * 1024; // 1M elements at a time
+    std::vector<int32_t> tmp(std::min(n, CHUNK));
+    for (size_t off = 0; off < n; off += CHUNK) {
+      size_t cnt = std::min(CHUNK, n - off);
+      for (size_t i = 0; i < cnt; i++) tmp[i] = (int32_t)events[off + i];
+      f.write(reinterpret_cast<const char *>(tmp.data()), cnt * sizeof(int32_t));
+    }
+    for (size_t off = 0; off < n; off += CHUNK) {
+      size_t cnt = std::min(CHUNK, n - off);
+      for (size_t i = 0; i < cnt; i++) tmp[i] = (int32_t)types[off + i];
+      f.write(reinterpret_cast<const char *>(tmp.data()), cnt * sizeof(int32_t));
+    }
+
+    // Write timestamp and id arrays directly (same type in memory and cache)
+    f.write(reinterpret_cast<const char *>(cb.getTimestamps().data()),
+            n * sizeof(uint64_t));
+    f.write(reinterpret_cast<const char *>(cb.getEndTimestamps().data()),
+            n * sizeof(uint64_t));
+    f.write(reinterpret_cast<const char *>(cb.getPids().data()),
+            n * sizeof(uint32_t));
+    f.write(reinterpret_cast<const char *>(cb.getSrcs().data()),
+            n * sizeof(uint32_t));
+    f.write(reinterpret_cast<const char *>(cb.getDsts().data()),
+            n * sizeof(uint32_t));
+    f.write(reinterpret_cast<const char *>(cb.getTags().data()),
+            n * sizeof(uint32_t));
+    f.write(reinterpret_cast<const char *>(cb.getRoots().data()),
+            n * sizeof(uint32_t));
+
+#ifdef USE_SCALASCA_TIMESTAMPS
+    if (hdr.flags & SOA_CACHE_FLAG_HAS_LEAVE_RECV_TS) {
+      f.write(reinterpret_cast<const char *>(cb.getLeaveRecvTs().data()),
+              n * sizeof(uint64_t));
+    }
+#endif
+  }
+
+  // Write comm_sets (variable length)
+  auto &coll_bytes_sent = cb.getCollBytesSent();
+  auto &coll_bytes_received = cb.getCollBytesReceived();
+
+  for (const auto &cs : comm_sets) {
+    uint64_t sz = cs.size();
+    f.write(reinterpret_cast<const char *>(&sz), sizeof(sz));
+    if (sz > 0)
+      f.write(reinterpret_cast<const char *>(cs.data()),
+              sz * sizeof(uint64_t));
+  }
+
+  // Write collective bytes
+  if (!coll_bytes_sent.empty())
+    f.write(reinterpret_cast<const char *>(coll_bytes_sent.data()),
+            coll_bytes_sent.size() * sizeof(uint64_t));
+  if (!coll_bytes_received.empty())
+    f.write(reinterpret_cast<const char *>(coll_bytes_received.data()),
+            coll_bytes_received.size() * sizeof(uint64_t));
+
+  f.close();
+  return f.good() || !f.fail();
+}
+
 ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
   ReaderPhase1Output result;
   result.handle = nullptr;
@@ -848,6 +982,53 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
 
   auto t_start = std::chrono::high_resolution_clock::now();
 
+  // ======== FINGERPRINT & CACHE CHECK ========
+  uint8_t fingerprint[32];
+  if (rank == 0) {
+    computeFileFingerprint(trace_path, fingerprint);
+  }
+  MPI_Bcast(fingerprint, 32, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+  // ======== TRY PER-RANK CACHE ========
+  std::string cache_path = getCachePath(trace_path, rank, comm_sz);
+  SoACacheData cached;
+  bool cache_hit = readSoACache(cache_path, fingerprint, rank, comm_sz, cached);
+
+  // All ranks must agree: if any rank has cache miss, all re-read OTF2
+  int local_hit = cache_hit ? 1 : 0;
+  int global_hit = 0;
+  MPI_Allreduce(&local_hit, &global_hit, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  cache_hit = (global_hit == 1);
+
+  if (cache_hit) {
+    auto t_cache = std::chrono::high_resolution_clock::now();
+    double cache_ms =
+        std::chrono::duration<double, std::milli>(t_cache - t_start).count();
+
+    if (rank == 0) {
+      std::cout << "[Reader] SoA cache HIT (" << cached.events.size()
+                << " events on rank 0), loaded in " << cache_ms << " ms"
+                << std::endl;
+    }
+
+    result.event_count = cached.events.size();
+    result.comm_sets = std::move(cached.comm_sets);
+    result.coll_bytes_sent = std::move(cached.coll_bytes_sent);
+    result.coll_bytes_received = std::move(cached.coll_bytes_received);
+
+    auto *holder = new SoACacheDataHolder();
+    holder->data = std::move(cached);
+    result.handle = static_cast<void *>(
+        new ReaderHandle(HANDLE_CACHE, static_cast<void *>(holder)));
+    return result;
+  }
+
+  if (rank == 0) {
+    std::cout << "[Reader] SoA cache MISS, performing OTF2 two-pass read..."
+              << std::endl;
+  }
+
+  // ======== NORMAL OTF2 TWO-PASS READ ========
   std::unordered_set<id_t> related_locs;
   id_t start_loc = 0, end_loc = 0, nlocs = 0;
 
@@ -956,27 +1137,170 @@ ReaderPhase1Output readOTF2TracePhase1(const std::string &trace_path) {
               << ")" << std::endl;
   }
 
+  // Free CollRedistBuffers before cache writing to reduce peak memory.
+  // It is no longer needed after redistribution.
+  {
+    CollRedistBuffers empty(0);
+    std::swap(redist, empty);
+  }
+
+  // ======== WRITE SOA CACHE (per-rank, streaming — no intermediate copy) ========
+  {
+    auto t_cache0 = std::chrono::high_resolution_clock::now();
+    bool ok = writeDirectSoACache(cache_path, fingerprint, rank, comm_sz, *data_cb);
+    auto t_cache1 = std::chrono::high_resolution_clock::now();
+    double cache_write_ms =
+        std::chrono::duration<double, std::milli>(t_cache1 - t_cache0).count();
+    if (rank == 0) {
+      if (ok)
+        std::cout << "[Reader] Per-rank SoA cache written to " << cache_path
+                  << " in " << cache_write_ms << " ms" << std::endl;
+      else
+        std::cout << "[Reader] Per-rank SoA cache write FAILED" << std::endl;
+    }
+  }
+
   result.event_count = data_cb->getEventCount();
   result.comm_sets = std::move(data_cb->getCommSets());
   result.coll_bytes_sent = std::move(data_cb->getCollBytesSent());
   result.coll_bytes_received = std::move(data_cb->getCollBytesReceived());
-  result.handle = static_cast<void *>(data_cb);
+  result.handle = static_cast<void *>(
+      new ReaderHandle(HANDLE_OTF2_CALLBACK, static_cast<void *>(data_cb)));
   return result;
 }
 
 void readerFillSoA(void *handle, TraceDataSoA &data) {
-  auto *cb = static_cast<Pass2DataCallback *>(handle);
+  auto *rh = static_cast<ReaderHandle *>(handle);
+  if (rh->tag == HANDLE_CACHE) {
+    auto *holder = static_cast<SoACacheDataHolder *>(rh->ptr);
+    size_t n = holder->data.events.size();
+    data.count = n;
+    if (n == 0) return;
+    for (size_t i = 0; i < n; i++)
+      data.events[i] = (event_t)holder->data.events[i];
+    for (size_t i = 0; i < n; i++)
+      data.types[i] = (event_type_t)holder->data.types[i];
+    std::memcpy(data.timestamps, holder->data.timestamps.data(), n * sizeof(timestamp_t));
+    std::memcpy(data.end_timestamps, holder->data.end_timestamps.data(), n * sizeof(timestamp_t));
+    std::memcpy(data.pids, holder->data.pids.data(), n * sizeof(id_t));
+    std::memcpy(data.srcs, holder->data.srcs.data(), n * sizeof(id_t));
+    std::memcpy(data.dsts, holder->data.dsts.data(), n * sizeof(id_t));
+    std::memcpy(data.tags, holder->data.tags.data(), n * sizeof(id_t));
+    std::memcpy(data.roots, holder->data.roots.data(), n * sizeof(id_t));
+    std::memcpy(data.replay_pids, holder->data.pids.data(), n * sizeof(id_t));
+    std::memset(data.tids, 0, n * sizeof(id_t));
+    for (size_t i = 0; i < n; i++)
+      data.indices[i] = (id_t)i;
+    std::memset(data.match_partner, 0xFF, n * sizeof(int32_t));
+    std::memset(data.coll_group_id, 0xFF, n * sizeof(int32_t));
+    return;
+  }
+  auto *cb = static_cast<Pass2DataCallback *>(rh->ptr);
   cb->fillSoAInto(data);
 }
 
 #ifdef USE_SCALASCA_TIMESTAMPS
 std::vector<timestamp_t> readerGetLeaveRecvTs(void *handle) {
-  auto *cb = static_cast<Pass2DataCallback *>(handle);
+  auto *rh = static_cast<ReaderHandle *>(handle);
+  if (rh->tag == HANDLE_CACHE) {
+    auto *holder = static_cast<SoACacheDataHolder *>(rh->ptr);
+    return std::move(holder->data.leave_recv_ts);
+  }
+  auto *cb = static_cast<Pass2DataCallback *>(rh->ptr);
   return std::move(cb->getLeaveRecvTs());
 }
 #endif
 
 void readerRelease(void *handle) {
-  auto *cb = static_cast<Pass2DataCallback *>(handle);
-  delete cb;
+  auto *rh = static_cast<ReaderHandle *>(handle);
+  if (rh->tag == HANDLE_CACHE) {
+    delete static_cast<SoACacheDataHolder *>(rh->ptr);
+  } else {
+    delete static_cast<Pass2DataCallback *>(rh->ptr);
+  }
+  delete rh;
+}
+
+void readerDownsizeHandle(void *&handle, const std::string &trace_path) {
+  auto *rh = static_cast<ReaderHandle *>(handle);
+  if (rh->tag == HANDLE_CACHE) return; // already lightweight
+
+  int rank = 0, comm_sz = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
+
+  // Compute fingerprint (same as Phase1 does)
+  uint8_t fingerprint[32];
+  if (rank == 0) {
+    computeFileFingerprint(trace_path, fingerprint);
+  }
+  MPI_Bcast(fingerprint, 32, MPI_BYTE, 0, MPI_COMM_WORLD);
+
+  std::string cache_path = getCachePath(trace_path, rank, comm_sz);
+
+  // Read ONLY the SoA event arrays from cache (skip comm_sets since they're
+  // already in phase1.comm_sets). For n4096, rank 0's comm_sets are ~24 GB,
+  // so skipping them is critical for memory savings.
+  SoACacheData cached;
+  {
+    SoACacheHeader hdr;
+    if (!isCacheValid(cache_path, fingerprint, rank, comm_sz, hdr)) {
+      if (rank == 0)
+        std::cerr << "[Reader] Warning: downsize failed (cache invalid), keeping callback" << std::endl;
+      return;
+    }
+    std::ifstream f(cache_path, std::ios::binary);
+    if (!f.is_open()) {
+      if (rank == 0)
+        std::cerr << "[Reader] Warning: downsize failed (cache unreadable), keeping callback" << std::endl;
+      return;
+    }
+    f.seekg(sizeof(SoACacheHeader));
+    size_t n = hdr.event_count;
+    if (n > 0) {
+      cached.events.resize(n);
+      cached.types.resize(n);
+      cached.timestamps.resize(n);
+      cached.end_timestamps.resize(n);
+      cached.pids.resize(n);
+      cached.srcs.resize(n);
+      cached.dsts.resize(n);
+      cached.tags.resize(n);
+      cached.roots.resize(n);
+      f.read(reinterpret_cast<char *>(cached.events.data()), n * sizeof(int32_t));
+      f.read(reinterpret_cast<char *>(cached.types.data()), n * sizeof(int32_t));
+      f.read(reinterpret_cast<char *>(cached.timestamps.data()), n * sizeof(uint64_t));
+      f.read(reinterpret_cast<char *>(cached.end_timestamps.data()), n * sizeof(uint64_t));
+      f.read(reinterpret_cast<char *>(cached.pids.data()), n * sizeof(uint32_t));
+      f.read(reinterpret_cast<char *>(cached.srcs.data()), n * sizeof(uint32_t));
+      f.read(reinterpret_cast<char *>(cached.dsts.data()), n * sizeof(uint32_t));
+      f.read(reinterpret_cast<char *>(cached.tags.data()), n * sizeof(uint32_t));
+      f.read(reinterpret_cast<char *>(cached.roots.data()), n * sizeof(uint32_t));
+      if (hdr.flags & SOA_CACHE_FLAG_HAS_LEAVE_RECV_TS) {
+        cached.leave_recv_ts.resize(n);
+        f.read(reinterpret_cast<char *>(cached.leave_recv_ts.data()), n * sizeof(uint64_t));
+      }
+    }
+    // Deliberately skip reading comm_sets and collective bytes
+  }
+
+  if (cached.events.empty()) {
+    if (rank == 0)
+      std::cerr << "[Reader] Warning: downsize failed (cache empty), keeping callback" << std::endl;
+    return;
+  }
+
+  // Delete the heavy callback
+  delete static_cast<Pass2DataCallback *>(rh->ptr);
+
+  // Replace with lightweight cache holder
+  auto *holder = new SoACacheDataHolder();
+  holder->data = std::move(cached);
+  rh->tag = HANDLE_CACHE;
+  rh->ptr = static_cast<void *>(holder);
+
+  if (rank == 0) {
+    std::cout << "[Reader] Handle downsized to cache-backed ("
+              << holder->data.events.size() << " events on rank 0)" << std::endl;
+  }
 }

@@ -126,3 +126,51 @@ For traces with tens of millions of events, the CPU matching could become a bott
 3. **Key-based partitioning**: Partition by key, then sequential matching within each partition
 
 This is deferred as a future optimization since matching is currently <1% of total time.
+
+---
+
+## GPU Sort-Based Matching (Phase 2)
+
+**Source**: `src/matching/GPUP2PMatching.cu`
+**Header**: `include/matching/GPUP2PMatching.h`
+**Enabled by**: `--gpu-matching` command-line flag
+
+### Algorithm: Sort-and-Rank Equivalence
+
+The GPU matching exploits a fundamental property of MPI's FIFO ordering:
+
+> For a fixed matching key `(sender, receiver, tag)`, the i-th send (ordered by timestamp) matches the i-th recv (ordered by timestamp).
+
+This eliminates the sequential FIFO queue dependency by reformulating matching as a parallel sort problem:
+
+1. **Classify**: GPU kernel classifies each event as send, recv, or neither, and computes the matching key `(sender, receiver, tag)` packed into 64 bits
+2. **Compact**: `thrust::copy_if` extracts sends and recvs into separate arrays with their original indices
+3. **Sort**: Two-level stable sort — first by timestamp (secondary), then by match key (primary) — produces events grouped by key and ordered by timestamp within each group
+4. **Assign ordinals**: `thrust::exclusive_scan_by_key` assigns within-group ordinals (0, 1, 2, ...) for each key group
+5. **Match**: GPU kernel binary-searches for each send's `(key, ordinal)` in the sorted recv array
+6. **Write**: Each matched pair writes bidirectional links to `match_partner[]`
+
+### Memory Requirements
+
+~50 bytes per event for GPU scratch (device_vectors for keys, timestamps, indices, ordinals).
+
+For n1024 (262M events, ~132M P2P events): ~6.6 GB GPU scratch. Fits in RTX 4090's 24 GB.
+
+### Fallback
+
+If GPU memory is insufficient or no GPU is available, falls back to the CPU FIFO algorithm automatically.
+
+### Performance
+
+| Trace | Events on rank 0 | GPU P2P | CPU P2P | Speedup | Pairs |
+|-------|------------------|---------|---------|---------|-------|
+| 16q (4M events) | 510K | 172 ms | 3,439 ms | **20x** | 254,052 |
+| n1024 (262M events) | 33M | 2,591 ms | 5,677 ms | **2.2x** | 16,387,584 |
+
+Correctness validated: GPU results exactly match CPU results on all P2P-dependent analyses (late_sender, late_receiver counts and sums identical).
+
+### Usage
+
+```bash
+srun --gres=gpu:4090:1 -n 8 ./build/gpu_analyzer /path/to/traces.otf2 --gpu-matching
+```

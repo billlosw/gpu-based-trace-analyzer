@@ -1,6 +1,7 @@
 #include "matching/CollectiveGrouping.h"
 
 #include <algorithm>
+#include <functional>
 #include <iostream>
 #include <set>
 #include <unordered_map>
@@ -72,24 +73,48 @@ void buildCollectiveGroups(const TraceDataSoA &data,
               return data.timestamps[a] < data.timestamps[b];
             });
 
-  // Cache: comm_set_idx -> {sorted comm_set, hash}
-  // MPI programs typically have 1-3 communicators, so this cache is tiny
-  // but avoids millions of redundant sorts.
+  // Cache: content-based dedup of communicators.
+  // MPI programs typically have 1-3 communicators. The old cache keyed by
+  // cs_idx never hit because each event has a unique sequential index.
+  // Fix: deduplicate by content using (size, first, last) as a fast key.
   struct CachedCommSet {
     std::vector<uint64_t> sorted_cs;
     uint64_t hash;
   };
-  std::unordered_map<size_t, CachedCommSet> cs_cache;
+  std::vector<CachedCommSet> unique_comms;
+
+  struct FingerprintKey {
+    uint32_t size;
+    uint64_t first;
+    uint64_t last;
+    bool operator==(const FingerprintKey &o) const {
+      return size == o.size && first == o.first && last == o.last;
+    }
+  };
+  struct FPHash {
+    size_t operator()(const FingerprintKey &k) const {
+      return std::hash<uint64_t>()(k.first) ^ (std::hash<uint64_t>()(k.last) << 16)
+           ^ (std::hash<uint32_t>()(k.size) << 32);
+    }
+  };
+  std::unordered_map<FingerprintKey, size_t, FPHash> fp_to_unique;
 
   auto getCachedCommSet = [&](size_t cs_idx) -> const CachedCommSet & {
-    auto it = cs_cache.find(cs_idx);
-    if (it != cs_cache.end())
-      return it->second;
-    CachedCommSet &entry = cs_cache[cs_idx];
-    entry.sorted_cs = comm_sets[cs_idx];
+    const auto &cs = comm_sets[cs_idx];
+    FingerprintKey fpk{(uint32_t)cs.size(),
+                       cs.empty() ? 0ULL : cs.front(),
+                       cs.empty() ? 0ULL : cs.back()};
+    auto it = fp_to_unique.find(fpk);
+    if (it != fp_to_unique.end())
+      return unique_comms[it->second];
+    size_t uid = unique_comms.size();
+    unique_comms.emplace_back();
+    CachedCommSet &entry = unique_comms.back();
+    entry.sorted_cs = cs;
     std::sort(entry.sorted_cs.begin(), entry.sorted_cs.end());
     entry.hash = hashCommSet(entry.sorted_cs);
-    return entry;
+    fp_to_unique[fpk] = uid;
+    return unique_comms.back();
   };
 
   // Group tracking

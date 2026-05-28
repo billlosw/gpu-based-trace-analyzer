@@ -151,6 +151,8 @@ for (int j = offsets[g]; j < offsets[g+1]; j++) {
 struct ReaderPhase1Output {
     size_t event_count;                         // Number of events this rank will store
     std::vector<std::vector<uint64_t>> comm_sets;  // Communicator member lists
+    std::vector<uint64_t> coll_bytes_sent;      // Per-event collective bytes
+    std::vector<uint64_t> coll_bytes_received;
     void *handle;                               // Opaque pointer to Pass2DataCallback
 };
 ```

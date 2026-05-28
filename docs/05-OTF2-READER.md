@@ -261,3 +261,91 @@ This matches TileTrace's behavior.
 | 32 | 2,400 ms | 44x |
 
 The read phase dominates total execution time (98%+ for 8-rank reading). As shown, parallel reading provides significant speedup.
+
+## Binary SoA Cache
+
+**Source**: `src/reader/SoACache.cpp`
+**Header**: `include/reader/SoACache.h`
+
+### Concept
+
+After the first OTF2 two-pass read + collective redistribution, each rank serializes its final per-rank SoA data (events, timestamps, comm_sets, etc.) to a binary file alongside the trace. On subsequent runs with the same trace and same rank count, these binary files are read directly — bypassing OTF2 callbacks entirely.
+
+### Cache File Format
+
+Each rank writes: `<trace_dir>/soa_cache/soa_cache_r<rank>_n<nprocs>.bin`
+
+```
+Header (SoACacheHeader):
+  magic:        8 bytes  "SOACACHE"
+  version:      4 bytes  uint32 (1)
+  nprocs:       4 bytes  uint32
+  rank:         4 bytes  uint32
+  flags:        4 bytes  uint32 (bit 0 = has_leave_recv_ts)
+  fingerprint:  32 bytes SHA-256 of trace anchor file
+  event_count:  8 bytes  uint64
+  num_comm_sets: 8 bytes uint64
+  reserved:     24 bytes (zero)
+
+Data (contiguous binary arrays):
+  events[count]         : int32
+  types[count]          : int32
+  timestamps[count]     : uint64
+  end_timestamps[count] : uint64
+  pids[count]           : uint32
+  srcs[count]           : uint32
+  dsts[count]           : uint32
+  tags[count]           : uint32
+  roots[count]          : uint32
+  leave_recv_ts[count]  : uint64 (only if has_leave_recv_ts flag)
+
+Comm sets (variable length):
+  For each: [size:u64, members[size]:u64]
+
+Collective bytes:
+  coll_bytes_sent[num_comm_sets]    : uint64
+  coll_bytes_received[num_comm_sets]: uint64
+```
+
+### Fingerprinting
+
+- SHA-256 hash of the OTF2 anchor file (`traces.otf2`) content
+- Computed by rank 0 and broadcast via MPI_Bcast
+- If trace is re-profiled, fingerprint changes → cache is invalidated and regenerated
+- SHA-256 implementation lives in `src/common/SHA256.cpp` / `include/common/SHA256.h` (no external dependency); `SoACache.cpp` calls through `sha256_file()`
+
+### Cache Validation
+
+All ranks must agree on cache validity (`MPI_Allreduce MIN`). If any rank's cache is missing or has a mismatched fingerprint, all ranks re-read from OTF2.
+
+### Integration
+
+Cache logic is integrated into `readOTF2TracePhase1()`. The opaque handle uses a `ReaderHandle` wrapper with a tag to dispatch between OTF2 callback data and per-rank cache:
+
+```cpp
+enum HandleType { HANDLE_OTF2_CALLBACK, HANDLE_CACHE };
+struct ReaderHandle { HandleType tag; void *ptr; };
+```
+
+The existing `readerFillSoA()`, `readerGetLeaveRecvTs()`, and `readerRelease()` functions dispatch based on the handle tag — the public API is unchanged.
+
+### Cache Writing: Streaming Approach
+
+Cache writing uses `writeDirectSoACache()` which streams directly from `Pass2DataCallback`'s internal vectors to disk via `std::ofstream`. This avoids materializing any intermediate `SoACacheData` or `TraceDataSoA` struct, eliminating ~1 GB/rank of peak memory overhead on large traces.
+
+Key design choices:
+- **Enum-to-int32 conversion** uses a chunked 1M-element temp buffer (4 MB) rather than allocating a full n-element array
+- **Timestamp and ID arrays** are written directly from callback vectors (same type in memory and cache format)
+- **Comm_sets and collective bytes** are referenced by ref from the callback (no copy)
+- **CollRedistBuffers freed before cache write** — swapped with empty object after redistribution completes
+
+### Performance Impact
+
+| Trace | OTF2 Read (miss) | Cache Read (hit) | Speedup |
+|-------|-------------------|-------------------|---------|
+| 16q (4M events, 16 ranks) | 19,095 ms | 24 ms | **780x** |
+| n1024 (262M events, 64 ranks) | 245,232 ms | 2,167 ms | **113x** |
+
+End-to-end pipeline improvement: 19,716 → 453 ms (16q, **43x**), 266,244 → 24,408 ms (n1024, **11x**).
+
+Cache write is a one-time cost (~1.7s for 16q, ~130s for n1024) amortized over all subsequent runs.

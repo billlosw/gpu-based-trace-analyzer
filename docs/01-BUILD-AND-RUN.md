@@ -90,12 +90,13 @@ srun --mpi=pmix -n 8 --gres=gpu:4090:1 ./build/gpu_analyzer /path/to/traces.otf2
 ### Command-Line Arguments
 
 ```
-Usage: gpu_analyzer <path/to/traces.otf2> [--time-correct]
+Usage: gpu_analyzer <path/to/traces.otf2> [--time-correct] [--gpu-matching]
 ```
 
-Two arguments:
+Arguments:
 1. The path to the OTF2 anchor file (`.otf2`) — required
 2. `--time-correct` — optional flag to enable CLC timestamp correction for blocking recv events
+3. `--gpu-matching` — optional flag to enable the GPU sort-based P2P matching and GPU segment-scan collective grouping paths where available
 
 ### SLURM Configuration on FUSE
 
@@ -124,6 +125,39 @@ Recommended values for `-n`:
 srun --gres=gpu:4090:1 ./build/test/test_p2p_matching
 srun --gres=gpu:4090:1 ./build/test/test_analysis_kernels
 srun --gres=gpu:4090:1 ./build/test/test_statistics
+```
+
+### Final Paper Data Collection
+
+`scripts/final_res.sh` runs the two paper trace sets used by the midterm scripts, but targets the RTX 5090 node by default and runs every trace twice:
+
+- normal mode
+- `--gpu-matching` mode
+
+Default server-side command:
+
+```bash
+cd /home/luosw22/claude/gpu-analyzer
+bash scripts/final_res.sh all
+```
+
+Default SLURM settings:
+
+```bash
+srun -N 1 -n 64 -w fuse2 -p Debug --mpi=pmix --gres=gpu:5090:1
+```
+
+The script writes timestamped logs under `~/logs/final-data/`. After the server run, copy those logs back to the local project under `chat-history/logs/final-data/` for paper extraction.
+
+Useful overrides:
+
+```bash
+# Run only one trace set
+bash scripts/final_res.sh cg
+bash scripts/final_res.sh lammps
+
+# Use a different partition or rank count if needed
+PARTITION=Long MPI_RANKS=64 bash scripts/final_res.sh all
 ```
 
 ### Generating Traces with Score-P

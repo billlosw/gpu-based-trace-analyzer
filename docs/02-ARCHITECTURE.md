@@ -9,12 +9,14 @@ gpu-analyzer/
 ├── include/
 │   ├── common/
 │   │   ├── types.h                     # Shared enums, typedefs
-│   │   └── cuda_check.h               # CUDA_CHECK error macro
+│   │   ├── cuda_check.h               # CUDA_CHECK error macro
+│   │   └── SHA256.h                   # sha256_file / sha256_buf (no external dep)
 │   ├── data/
 │   │   ├── TraceDataSoA.h             # SoA data structure + CSR struct
 │   │   └── AnalysisResults.h          # Result struct for statistics
 │   ├── reader/
-│   │   └── OTF2SoAReader.h            # Reader interface (split-phase API)
+│   │   ├── OTF2SoAReader.h            # Reader interface (split-phase API)
+│   │   └── SoACache.h                 # Per-rank binary SoA cache format + API
 │   ├── matching/
 │   │   ├── P2PMatching.h              # P2P matching interface
 │   │   └── CollectiveGrouping.h       # Collective grouping interface
@@ -24,8 +26,11 @@ gpu-analyzer/
 │       └── TimestampCorrection.h      # CLC timestamp correction interface
 ├── src/
 │   ├── main.cu                        # Entry point, pipeline orchestration
+│   ├── common/
+│   │   └── SHA256.cpp                 # Minimal SHA-256 (no external dependency)
 │   ├── reader/
-│   │   └── OTF2SoAReader.cpp          # OTF2 -> SoA reader implementation
+│   │   ├── OTF2SoAReader.cpp          # OTF2 -> SoA reader implementation
+│   │   └── SoACache.cpp               # Per-rank binary SoA cache (read/write)
 │   ├── matching/
 │   │   ├── P2PMatching.cpp            # CPU-based P2P matching (pure C++)
 │   │   └── CollectiveGrouping.cpp     # CPU collective grouping
@@ -51,6 +56,8 @@ gpu-analyzer/
              v     v      v     v
     OTF2SoAReader  P2PMatching  CollectiveGrouping  TimestampCorrection
          |              |              |                    |
+      SoACache          |              |                    |
+         |              |              |                    |
          v              v              v                    v
      TraceDataSoA  TraceDataSoA  CollectiveGroupCSR   TraceDataSoA
          |              |              |                    |
@@ -70,7 +77,7 @@ gpu-analyzer/
 
 **Location**: `src/main.cu`
 
-Coordinates the distributed pipeline with two primary code paths:
+Coordinates the distributed pipeline with three primary code paths:
 
 **Single-rank path** (`mpi_size == 1`):
 1. `readOTF2TracePhase1()` — two-pass reading, returns event count + opaque handle
@@ -81,7 +88,7 @@ Coordinates the distributed pipeline with two primary code paths:
 6. `runAnalysisKernels()` — synchronous GPU analysis
 7. `computeStatistics()` + print results
 
-**Multi-rank, same-node path** (primary — `sharedMemoryDirectAnalysis()`):
+**Multi-rank, same-node path** (`sharedMemoryDirectAnalysis()`):
 1. All ranks: `readOTF2TracePhase1()` — distributed two-pass reading
 2. `MPI_Allgather` event counts, compute offsets
 3. `MPI_Win_allocate_shared` — single contiguous shared memory window
@@ -100,15 +107,15 @@ Coordinates the distributed pipeline with two primary code paths:
 
 **Important**: `MPI_Init()` and `MPI_Finalize()` are called by all ranks. The program must be run with `srun` or `mpirun`. Accepts `--time-correct` as optional argument.
 
-### `OTF2SoAReader.cpp` - Trace Reader (Distributed Two-Pass, Split-Phase API)
+### `OTF2SoAReader.cpp` - Trace Reader (Distributed Two-Pass, Split-Phase API, SoA Cache)
 
 **Location**: `src/reader/OTF2SoAReader.cpp`
 
-The largest and most complex module. Uses TileTrace-style two-pass distributed reading with a **split-phase API** that allows the caller to choose where data is stored:
+The largest and most complex module. Uses TileTrace-style two-pass distributed reading with a **split-phase API** that allows the caller to choose where data is stored. Includes **binary SoA cache** (`SoACache.cpp`) for fast subsequent reads:
 
-- `readOTF2TracePhase1()` — Runs pass1 + pass2 + redistribution, returns `ReaderPhase1Output` with event count, comm_sets, and opaque handle (Pass2DataCallback*)
-- `readerFillSoA(handle, data)` — Copies vectors from the handle into pre-set SoA pointers (the SoA can point into a shared memory window)
-- `readerRelease(handle)` — Frees the opaque handle (deleting Pass2DataCallback and its vectors)
+- `readOTF2TracePhase1()` — First checks per-rank binary cache (SHA-256 fingerprint match). On cache hit, returns immediately. On miss, runs pass1 + pass2 + redistribution, then writes cache. Returns `ReaderPhase1Output` with event count, comm_sets, and opaque handle
+- `readerFillSoA(handle, data)` — Copies vectors from the handle into pre-set SoA pointers (dispatches via tagged `ReaderHandle`)
+- `readerRelease(handle)` — Frees the opaque handle
 
 Internal components:
 - `Pass1DiscoveryCallback`: Lightweight first pass that discovers communication partners
@@ -168,14 +175,16 @@ Activated by `--time-correct` command-line flag (compile-time `USE_SCALASCA_TIME
 
 ```
 OTF2SoAReader::readOTF2TracePhase1()
+    → [Cache check order: 1. per-rank binary, 2. OTF2]
+    → On per-rank HIT: reads binary soa_cache_r<rank>_n<nprocs>.bin (100-780x faster)
+    → On MISS: pass1 + pass2 + redistribution + writes cache
     → ReaderPhase1Output { event_count, comm_sets, opaque handle }
 
-OTF2SoAReader::readerFillSoA(handle, data)
-    → Fills TraceDataSoA arrays (can target shared memory window)
+[SHM path: sharedMemoryDirectAnalysis()]
+    → readerFillSoA(handle, data) into MPI SHM window
+    → readerRelease(handle)
 
-OTF2SoAReader::readerRelease(handle)
-    → Frees reader internal vectors
-
+[Common pipeline:]
 P2PMatching::runP2PMatching(data)
     → Fills data.match_partner[i] in-place
 
@@ -185,11 +194,8 @@ CollectiveGrouping::buildCollectiveGroups(data, comm_sets)
 TimestampCorrection::applyTimestampCorrection(data)
     → Modifies data.end_timestamps[i] for blocking recv CLC violations
 
-AnalysisKernels::runAnalysisKernels(data, csr)
-    → RawAnalysisOutput { 8 vectors of durations (picoseconds), sub-phase timings }
-
 AnalysisKernels::runAnalysisKernelsAsync(data, csr, pool, stream)
-    → Same output, using pre-allocated GPUMemoryPool and CUDA stream
+    → RawAnalysisOutput { 8 vectors of durations (picoseconds), sub-phase timings }
 
 Statistics::computeStatistics(durations)
     → AnalysisResult { count, mean, median, min, max, sum, variance, q25, q75 }
@@ -201,7 +207,9 @@ The project builds as a static library `gpu_analyzer_lib` plus a `gpu_analyzer` 
 
 ```cmake
 add_library(gpu_analyzer_lib STATIC
+    src/common/SHA256.cpp                # Minimal SHA-256 (no external dep)
     src/reader/OTF2SoAReader.cpp        # Pure C++ with MPI
+    src/reader/SoACache.cpp             # Per-rank binary SoA cache (read/write)
     src/matching/P2PMatching.cpp         # Pure C++ (was .cu, renamed for perf)
     src/matching/CollectiveGrouping.cpp
     src/analysis/AnalysisKernels.cu      # CUDA kernels + GPUMemoryPool
@@ -232,9 +240,15 @@ set(TIMESTAMP_MODE "SCALASCA" CACHE STRING "Timestamp mode: SCALASCA or TILETRAC
 ```
 Time →
 
+=== Cached Path (SoA Binary Cache Hit) ===
+
+All Ranks:  [= SHA-256 check =][= fread() binary cache =]
+                         ↓ (24 ms for 16q, 2.2s for n1024)
+            → continues to SHM Analysis below
+
 === Same-Node Path (Primary, sharedMemoryDirectAnalysis) ===
 
-All Ranks:  [= Pass 1 =][== Pass 2 ==][= Redist =]
+All Ranks:  [= Pass 1 =][== Pass 2 ==][= Redist =][= write cache =]
                          ↓
             [== fill_soa into SHM ==][= P2P =][= Coll =][= TS Correct =]
                          ↓

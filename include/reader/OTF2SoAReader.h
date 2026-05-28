@@ -50,4 +50,12 @@ std::vector<timestamp_t> readerGetLeaveRecvTs(void *handle);
 // Free the opaque handle. Must be called exactly once after readerFillSoA.
 void readerRelease(void *handle);
 
+// Downsize the opaque handle to reduce memory footprint.
+// If the handle holds the full OTF2 callback data (~50 bytes/event × N events),
+// this re-reads the per-rank binary cache (which was just written) and replaces
+// the handle with a cache-backed one. Saves ~55 GB for n4096 (128 ranks × 9M events).
+// No-op if the handle is already cache-backed.
+// trace_path is needed to locate the cache files.
+void readerDownsizeHandle(void *&handle, const std::string &trace_path);
+
 #endif // GPU_ANALYZER_OTF2_SOA_READER_H
